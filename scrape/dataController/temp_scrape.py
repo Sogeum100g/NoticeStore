@@ -1,9 +1,8 @@
 # 사용자 요청 주소에 대한 method, api_url, header, payload를 넘김
-import asyncio
 from urllib.parse import urlparse
 import requests
 import re
-from bs4 import BeautifulSoup, Comment
+from bs4 import BeautifulSoup
 import json
 
 import sys, os
@@ -17,11 +16,7 @@ from dbController import update_db
 
 from detect_api_auto import find_api
 from dotenv import load_dotenv
-from google import genai
-import datetime
-import pytz
-from dbController.db_manager import get_db_connection
-import hashlib
+from repositories.db_manager import get_db_connection
 
 import yaml
 from pathlib import Path

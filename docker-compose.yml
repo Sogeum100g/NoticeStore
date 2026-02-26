@@ -1,0 +1,72 @@
+services:
+  # 백엔드 API 서버
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - db
+    # ==========================================
+    # [추가] 백그라운드 스케줄링 시스템
+    # ==========================================
+
+  # 1. 메시지 브로커 (작업 대기열 관리)
+  redis:
+    image: redis:7-alpine
+    container_name: noticestore_redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+  # 2. Celery 워커 (백그라운드에서 무거운 크롤링을 실제 수행)
+  celery_worker:
+    build: . # API 서버와 동일한 파이썬 환경(Playwright 등)을 사용합니다.
+    container_name: noticestore_celery_worker
+    restart: always
+    # 주의: '-A main.celery' 부분은 실제 파이썬 파일 구조에 맞춰야 합니다.
+    command: celery -A celery_app worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      # DB 환경변수도 워커가 알아야 DB에 접근할 수 있습니다.
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    depends_on:
+      - db
+      - redis
+
+  # 3. Celery 비트 (스케줄러: 특정 시간마다 워커에게 작업을 지시)
+  celery_beat:
+    build: .
+    container_name: noticestore_celery_beat
+    restart: always
+    # 주의: 워커와 동일하게 앱 위치를 맞춰야 합니다.
+    command: celery -A celery_app beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+      - POSTGRES_DB=${DB_NAME}
+    depends_on:
+      - db
+      - redis
+
+  # 데이터베이스 (오라클 클라우드에 따로 DB가 없다면 컨테이너로 띄웁니다)
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}       # .env 파일에 설정된 값을 가져옵니다.
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # 이 한 줄만 추가하면 도커가 켜질 때 테이블을 다 만들어줌
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  postgres_data:

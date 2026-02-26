@@ -342,7 +342,11 @@ venv.bak/
 sites.json
 tag.json
 prompt_data.yaml
-dbController/
+*.pyc
+.vscode/
+node_modules/
+notice-store-firebase-adminsdk-fbsvc-dc41f1152a.json
+
 
 # Spyder project settings
 .spyderproject

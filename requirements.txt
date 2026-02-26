@@ -1,0 +1,31 @@
+# [실행 및 스케줄링]
+apscheduler==3.11.2       # 정해진 시간마다 크롤러를 자동으로 실행하는 스케줄러
+uvicorn==0.41.0           # FastAPI 앱을 실행시키는 ASGI 웹 서버
+celery==5.6.2
+redis                     # Celery 브로커 통신용
+
+# [웹 프레임워크 및 데이터 검증]
+fastapi==0.133.1          # 프로젝트의 메인 백엔드 API 프레임워크
+starlette==0.52.1         # FastAPI의 기반이 되는 저수준 웹 툴킷
+pydantic==2.12.5          # 데이터 타입 검증 및 설정 관리를 위한 라이브러리
+
+# [크롤링 및 데이터 추출]
+playwright==1.58.0        # 브라우저를 제어하여 동적 페이지를 크롤링하고 네트워크를 가로챔
+beautifulsoup4==4.14.3    # 수집한 HTML 데이터를 파싱하고 정제하는 도구
+lxml                      # BeautifulSoup의 고속 파서
+Requests==2.32.5          # 간단한 HTTP 요청 및 리다이렉션 추적용
+httpx==0.28.1             # 비동기(Async) HTTP 클라이언트 요청 처리
+
+# [인공지능 및 데이터 정제]
+google-genai              # Gemini AI를 사용하여 비정형 데이터를 정형 데이터로 변환
+protobuf==6.33.5          # 구글 API 통신을 위한 데이터 직렬화 라이브러리
+
+# [데이터베이스 및 보안]
+psycopg[binary]==3.3.2    # PostgreSQL 데이터베이스와 통신하기 위한 드라이버
+PyJWT==2.11.0             # 사용자 인증을 위한 JSON Web Token 생성 및 검증
+python-dotenv==1.2.1      # .env 파일의 환경 변수(DB 주소, API 키 등)를 로드
+
+# [알림 및 기타 유틸리티]
+firebase_admin==7.1.0     # 앱 푸시 알림(FCM) 발송을 위한 파이어베이스 관리 도구
+pytz==2025.2              # 한국 시간(Asia/Seoul) 등 시간대 설정 처리
+PyYAML==6.0.3             # YAML 형식의 설정 파일(prompt_data.yaml) 로드

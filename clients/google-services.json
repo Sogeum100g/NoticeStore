@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "755718526897",
+    "project_id": "notice-store",
+    "storage_bucket": "notice-store.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:755718526897:android:cb56ac509ddc5b483acf90",
+        "android_client_info": {
+          "package_name": "com.noticestore.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBtxwADgvfZrIX5a3tXCbCkHGLNdtA1qj8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,12 @@
+flutter_launcher_icons:
+  android: true
+  ios: true # 나중에 iOS 빌드할 때도 쓰려면 true
+  image_path: "assets/images/pigeon.png" # 준비한 이미지 경로 .png
+  # 안드로이드 8.0 이상 '적응형 아이콘' 설정 (선택)
+  adaptive_icon_background: "#000000" # 배경색
+  adaptive_icon_foreground: "assets/images/pigeon.png" # 앞면 로고 .png
+  # 윈도우 설정 추가
+  windows:
+    generate: true
+    image_path: "assets/images/pigeon_cutout.ico" # 동일한 로고 이미지 사용 .ico
+    icon_size: 256 # 윈도우 아이콘 권장 사이즈
