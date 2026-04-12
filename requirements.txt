@@ -3,6 +3,7 @@ apscheduler==3.11.2       # 정해진 시간마다 크롤러를 자동으로 실
 uvicorn==0.41.0           # FastAPI 앱을 실행시키는 ASGI 웹 서버
 celery==5.6.2
 redis                     # Celery 브로커 통신용
+gunicorn>=20.1.0          # Gunicorn이 마스터 프로세스가 되어 4개의 Uvicorn 워커를 관리
 
 # [웹 프레임워크 및 데이터 검증]
 fastapi==0.133.1          # 프로젝트의 메인 백엔드 API 프레임워크
