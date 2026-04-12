@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
-from repositories.user_repo import get_or_create_user
+from repositories.user_repo import get_or_create_user, upsert_device_fcm_token
 # 분리해둔 스키마 및 DB 함수 임포트
 from schemas import LoginRequest
 
@@ -50,8 +50,7 @@ def create_access_token(data: dict):
 @router.post("/login")
 async def social_login(request: LoginRequest):
     """
-    구글 소셜 로그인을 처리하고 JWT 토큰을 발급합니다.
-    신규 유저일 경우 자동으로 회원가입 처리(get_or_create_user)를 수행합니다.
+    구글 소셜 로그인을 처리하고, 기기별 FCM 토큰을 1:N 테이블에 등록합니다.
     """
     # 1. 구글 토큰 검증
     user_info = verify_google_token(request.access_token)
@@ -64,31 +63,39 @@ async def social_login(request: LoginRequest):
     email = user_info.get("email")
     social_id = user_info.get("sub")
 
-    # 2. DB에서 사용자 확인 또는 생성
-    # [cite: 2026-02-20] 로직 반영: 닉네임 유무에 따른 튜플 처리
+    # 2. 사용자 조회 또는 생성 (계정 본연의 정보만 처리) [cite: 2026-03-10]
     user_data = get_or_create_user(
         email=email,
         social_id=social_id,
         provider=request.provider,
-        fcm_token=request.fcm_token
+        referrer_code=request.referrer_code
     )
 
-    if isinstance(user_data, tuple):
-        user_id, nickname = user_data
-    else:
-        user_id = user_data
-        nickname = None  # 신규 유저이거나 닉네임 정보가 없는 경우
+    if not user_data:
+        raise HTTPException(
+            status_code=500,
+            detail="사용자 정보를 생성하거나 조회하는 데 실패했습니다."
+        )
 
-    # 3. 자체 서비스용 JWT 토큰 생성
-    access_token = create_access_token(data={"sub": str(user_id)})
+    # 3. 🚀 [핵심 추가] 기기별 FCM 토큰 등록 (1:N 구조 지원) [cite: 2026-03-10]
+    # 클라이언트(Flutter)에서 보낸 device_id와 device_type을 사용합니다.
+    if request.fcm_token and request.device_id:
+        upsert_success = upsert_device_fcm_token(
+            user_id=user_data["user_id"],
+            fcm_token=request.fcm_token,
+            device_id=request.device_id,
+            device_type=request.device_type
+        )
+        if not upsert_success:
+            # 토큰 등록 실패는 로그만 남기고 로그인은 진행할 수 있습니다.
+            print(f"⚠️ [FCM] 유저 {user_data['user_id']}의 기기 등록 실패")
 
+    # 4. 자체 서비스용 JWT 토큰 생성
+    access_token = create_access_token(data={"sub": str(user_data["user_id"])})
+
+    # 5. 전체 데이터 응답
     return {
         "status": "success",
         "access_token": access_token,
-        "user": {
-            "user_id": user_id,
-            "email": email,
-            "nickname": nickname,
-            "provider": request.provider
-        }
+        "user": user_data 
     }

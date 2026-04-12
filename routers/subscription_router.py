@@ -1,45 +1,70 @@
 from fastapi import APIRouter, HTTPException, Depends, status
 from typing import List
 
-from repositories.notice_repo import add_user_subscription, get_user_specific_sites, delete_user_subscription, \
-    update_user_view_time
-# 분리해둔 스키마 및 의존성 임포트
-from schemas import SiteRequest
+from repositories.notice_repo import (
+    add_user_subscription, 
+    get_user_specific_sites, 
+    delete_user_subscription, 
+    update_user_view_time,
+)
+from repositories.user_repo import (
+    get_user_max_sites_limit,             # 💡 한도 체크용 함수 임포트
+    get_current_subscription_count  # 💡 구독 개수 체크용 함수 임포트
+)
+from schemas import SiteRequest, SiteResponse
 from dependencies import get_current_user_id
-
-# DB 및 크롤링 핵심 함수 임포트
 
 from scrape.dataController.scrape_auto import run_full_scrape
 
-# 구독 및 사이트 관련 경로를 담당하는 라우터
+# 라우터 태그 명확화
 router = APIRouter(tags=["Subscriptions"])
 
-
-@router.post("/add-site")
+@router.post("/add-site", response_model=SiteResponse)
 async def add_new_site(
-        request: SiteRequest,
-        user_id: int = Depends(get_current_user_id)
+    request: SiteRequest,
+    user_id: int = Depends(get_current_user_id) # 여기서 인증 실패 시 자동으로 401(NEED_LOGIN 대응 가능)
 ):
-    """
-    새로운 사이트 URL을 입력받아 즉시 크롤링을 수행하고 구독 목록에 추가합니다.
+    # 1. 사이트 한도 체크 (플러터의 MAX_SITES_LIMIT와 일치)
+    max_limit = get_user_max_sites_limit(user_id)
+    current_count = get_current_subscription_count(user_id)
 
-    """
-    # 1. 사이트 크롤링 및 사이트 테이블 등록 (내부적으로 sites 테이블 처리)
-    result = await run_full_scrape(request.url)
-    site_id = result.get('site_id')
-
-    if not site_id:
+    if current_count >= max_limit:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="사이트 등록 및 초기 크롤링에 실패했습니다."
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="MAX_SITES_LIMIT" 
         )
 
-    # 2. 구독 테이블(user_subscriptions)에 관계 저장
-    add_user_subscription(user_id, site_id, request.alias)
+    # 2. 크롤링 실행
+    result = await run_full_scrape(request.url)
+    scrape_status = result.get('status')
+    site_id = result.get('site_id')
 
+    # 3. 결과 상태별 분기 (플러터의 ROBOTS_TXT_BLOCKED 등과 일치)
+    if scrape_status == "blocked":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="ROBOTS_TXT_BLOCKED"
+        )
+    
+    if scrape_status == "error" or not site_id:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="CRAWLING_ERROR" # 필요 시 플러터 스위치문에 추가 가능
+        )
+
+    # 4. DB 저장
+    try:
+        add_user_subscription(user_id, site_id, request.alias)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
+            detail="DATABASE_ERROR"
+        )
+
+    # 5. 성공 응답 (플러터가 기대하는 success 구조)
     return {
         "status": "success",
-        "message": "구독 목록에 성공적으로 추가되었습니다.",
+        "message": "SUCCESS",
         "site_id": site_id
     }
 
