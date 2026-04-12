@@ -91,8 +91,9 @@ def select_api(target_url: str) -> Optional[Dict[str, Any]]:
     if not conn: return None
     try:
         with conn.cursor(row_factory=dict_row) as cur:
+            # SELECT 절에 s.site_id 를 명시적으로 추가했습니다.
             query = """
-                SELECT a.method_type, a.api_url, a.headers, a.payload, a.created_at
+                SELECT s.site_id, a.method_type, a.api_url, a.headers, a.payload, a.created_at
                 FROM sites s
                 JOIN api a ON s.site_id = a.site_id
                 WHERE s.site_url = %s;
@@ -191,14 +192,18 @@ def get_user_specific_sites(user_id: int) -> List[tuple]:
     if not conn: return []
     try:
         with conn.cursor() as cur:
+            # 마지막 동기화 시간 이후에 새롭게 등록된(created_at) 공지가 하나라도 있는지 확인
             query = """
                     SELECT s.site_id, s.site_url, us.alias,
-                        CASE 
-                            WHEN (SELECT COUNT(*) FROM notices n WHERE n.site_id = s.site_id) = 0 THEN false
-                            WHEN us.last_synced_at IS NULL THEN true
-                            WHEN (SELECT MAX(created_at) FROM notices n WHERE n.site_id = s.site_id) > us.last_synced_at THEN true 
-                            ELSE false 
-                        END as has_new
+                    CASE 
+                        WHEN us.last_synced_at IS NULL THEN true
+                        WHEN EXISTS (
+                            SELECT 1 FROM notices n 
+                            WHERE n.site_id = s.site_id 
+                            AND n.created_at > us.last_synced_at
+                        ) THEN true
+                        ELSE false 
+                    END as has_new
                     FROM user_subscriptions us
                     JOIN sites s ON us.site_id = s.site_id
                     WHERE us.user_id = %s;
@@ -274,19 +279,19 @@ def update_user_view_time(site_id: int, user_id: int):
 
 # --- [3. 공지사항(Notice) 관리] ---
 
-def insert_notice(site_id: int, title: str, author: str, url: str, content_preview: str, created_at: datetime.datetime, scraped_at: datetime.datetime) -> Optional[int]:
+def insert_notice(site_id: int, title: str, author: str, url: str, created_at: datetime.datetime, scraped_at: datetime.datetime) -> Optional[int]:
     """공지사항을 데이터베이스에 새로 저장합니다. 중복 시 무시(DO NOTHING)합니다."""
     conn = get_db_connection()
     if not conn: return None
     try:
         with conn.cursor() as cur:
             query = """
-                INSERT INTO notices (site_id, title, author, url, content_preview, created_at, scraped_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO notices (site_id, title, author, url, created_at, scraped_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (site_id, title, author) DO NOTHING
                 RETURNING notice_id;
             """
-            cur.execute(query, (site_id, title, author, url, content_preview, created_at, scraped_at))
+            cur.execute(query, (site_id, title, author, url, created_at, scraped_at))
             result = cur.fetchone()
             if result:
                 new_notice_id = result[0]
@@ -303,27 +308,41 @@ def insert_notice(site_id: int, title: str, author: str, url: str, content_previ
     finally:
         conn.close()
 
-def insert_or_update_notice(site_id: int, title: str, author: str, url: str, content_preview: str, created_at: datetime.datetime, scraped_at: datetime.datetime, is_active: bool = True):
+def insert_or_update_notice(site_id: int, title: str, author: str, url: str, created_at: datetime.datetime, scraped_at: datetime.datetime, is_active: bool = True):
     """
     공지사항을 저장하거나, 이미 존재할 경우 정보를 업데이트하고 활성화 상태로 변경합니다.
+    (site_id, title) 제약 조건에 맞춰 작동하며, 제목의 공백을 정규화하여 중복을 방지합니다.
     """
     conn = get_db_connection()
-    if not conn: return
+    if not conn:
+        return
+
+    # 💡 [핵심] 제목 정규화: LLM이 만든 미세한 공백 차이를 DB 제약 조건과 일치시킵니다.
+    # 연속된 공백을 한 칸으로 줄이고 앞뒤 공백을 제거합니다.
+    clean_title = " ".join(title.split()).strip() if title else ""
+    clean_author = author.strip() if author else ""
+    clean_url = url.strip() if url else ""
+
+    # 💡 [안전장치] LLM이 날짜를 못 찾았을 경우, 수집 시점을 생성일로 간주합니다.
+    # 이렇게 하면 DB의 NOT NULL 제약조건을 지키면서 '최초 발견일' 원칙을 유지합니다.
+    final_created_at = created_at if created_at else scraped_at
+
     try:
         with conn.cursor() as cur:
+            # ON CONFLICT 대상에서 author를 제외하고 (site_id, title)만 사용합니다.
             query = """
                 INSERT INTO notices (
-                    site_id, title, author, url, content_preview, created_at, scraped_at, is_active
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (site_id, title, author) 
+                    site_id, title, author, url, created_at, scraped_at, is_active
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (site_id, title) 
                 DO UPDATE SET 
-                    content_preview = EXCLUDED.content_preview,
+                    url = EXCLUDED.url,           -- 상세 URL이 확보되면 갱신되도록 포함
                     scraped_at = EXCLUDED.scraped_at,
-                    is_active = EXCLUDED.is_active,
-                    author = EXCLUDED.author;
+                    is_active = EXCLUDED.is_active;
             """
-            cur.execute(query, (site_id, title, author, url, content_preview, created_at, scraped_at, is_active))
+            cur.execute(query, (site_id, clean_title, clean_author, clean_url, final_created_at, scraped_at, is_active))
             conn.commit()
+            
     except Exception as e:
         print(f"❌ 데이터 저장/업데이트 중 에러 발생: {e}")
         conn.rollback()
@@ -331,7 +350,7 @@ def insert_or_update_notice(site_id: int, title: str, author: str, url: str, con
         conn.close()
 
 def deactivate_old_notices(site_id: int):
-    """DB 최적화를 위해 6개월이 경과한 공지사항을 비활성화 처리합니다."""
+    """DB 최적화를 위해 3개월이 경과한 공지사항을 비활성화 처리합니다."""
     conn = get_db_connection()
     if not conn: return
     try:
@@ -341,7 +360,7 @@ def deactivate_old_notices(site_id: int):
                 SET is_active = false
                 WHERE site_id = %s
                   AND is_active = true
-                  AND created_at < CURRENT_TIMESTAMP - INTERVAL '6 months';
+                  AND created_at < CURRENT_TIMESTAMP - INTERVAL '3 months';
             """
             cur.execute(query, (site_id,))
             conn.commit()
@@ -359,10 +378,10 @@ def get_all_notices(url: str) -> List[tuple]:
     try:
         with conn.cursor() as cur:
             query = """
-                SELECT n.notice_id, n.title, n.author, n.url, n.content_preview, n.created_at, n.scraped_at
+                SELECT n.notice_id, n.title, n.author, n.url, n.created_at, n.scraped_at
                 FROM notices n
                 JOIN sites s ON n.site_id = s.site_id
-                WHERE n.url = %s AND is_active = true
+                WHERE s.site_url = %s AND n.is_active = true
                 ORDER BY n.created_at DESC;
             """
             cur.execute(query, (url, ))
@@ -371,17 +390,30 @@ def get_all_notices(url: str) -> List[tuple]:
     finally:
         conn.close()
 
-def get_all_user_notices(user_id: int) -> List[tuple]:
+def get_latest_notice_title(url: str) -> str:
+    """해당 URL에서 가장 최근에 저장된 공지사항의 제목을 반환합니다."""
+    notices = get_all_notices(url)
+    if notices:
+        # result[0]은 (notice_id, title, author, url, created_at, scraped_at) 형태입니다.
+        return notices[0][1] # title 필드 반환
+    return "없음"
+
+
+def get_all_user_notices(user_id: int) -> List[dict]:
     """
     사용자가 구독한 모든 사이트의 공지 목록을 최신순으로 가져옵니다.
     사용자가 숨김 처리한(user_hidden_notices) 공지는 제외합니다.
+    결과는 dict_row를 사용하여 딕셔너리 리스트로 반환합니다.
     """
     conn = get_db_connection()
-    if not conn: return []
+    if not conn: 
+        return []
+        
     try:
-        with conn.cursor() as cur:
+        # 💡 psycopg3의 row_factory=dict_row를 사용하여 결과를 딕셔너리로 받습니다.
+        with conn.cursor(row_factory=dict_row) as cur:
             query = """
-                SELECT n.notice_id, n.title, n.author, n.url, n.content_preview, n.created_at, n.scraped_at, n.site_id
+                SELECT n.notice_id, n.title, n.author, n.url, n.created_at, n.scraped_at, n.site_id
                 FROM notices n
                 INNER JOIN user_subscriptions us ON n.site_id = us.site_id
                 WHERE us.user_id = %s
@@ -396,9 +428,12 @@ def get_all_user_notices(user_id: int) -> List[tuple]:
             """
             cur.execute(query, (user_id, user_id))
             result = cur.fetchall()
+            
+            # 이제 result는 [{"notice_id": 1, "title": "..."}, ...] 형태입니다.
             return result if result else []
+            
     except Exception as e:
-        print(f"공지 목록 조회 중 에러 발생: {e}")
+        print(f"❌ 공지 목록 조회 중 에러 발생: {e}")
         return []
     finally:
         conn.close()
@@ -433,18 +468,19 @@ def get_global_crawl_targets() -> List[dict]:
     conn = get_db_connection()
     if not conn: return []
     try:
-        with conn.cursor() as cur:
-            # 쿼리 핵심: DISTINCT를 통해 중복 크롤링 방지
+        # 💡 psycopg3 컨벤션에 맞춰 row_factory=dict_row 적용
+        with conn.cursor(row_factory=dict_row) as cur:
+            # Celery 태스크가 target.get('url')을 사용하므로 site_url을 url로 별칭 지정
             query = """
-                SELECT DISTINCT s.site_id, s.site_url
+                SELECT DISTINCT s.site_id, s.site_url AS url
                 FROM sites s
                 JOIN user_subscriptions us ON s.site_id = us.site_id;
             """
             cur.execute(query)
-            # Celery Task에서 사용하기 편하게 딕셔너리 리스트로 반환
-            return [{"site_id": row[0], "url": row[1]} for row in cur.fetchall()]
+            return cur.fetchall()
+        
     except Exception as e:
-        print(f"전역 크롤링 대상 조회 실패: {e}")
+        print(f"❌ 전역 크롤링 대상 조회 실패: {e}") 
         return []
     finally:
         conn.close()
