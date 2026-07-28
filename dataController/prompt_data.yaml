@@ -1,0 +1,45 @@
+# prompt_data.yaml
+prompts:
+  api_selector: |
+    당신은 웹 데이터 추출 파이프라인의 최종 후보 선택기입니다.
+    입력 후보들은 이미 수집기와 랭커를 거쳐 추려진 상위 후보입니다.
+    {api_list} 중 실제 목록 본문 데이터(공지, 게시글, 채용공고, 이벤트, 입찰공고 등)를 담고 있는 후보를 고르십시오.
+    유효한 후보가 없으면 index=-1을 반환하십시오.
+
+    원칙:
+    1. 실제 리스트 데이터를 담은 후보를 선택합니다.
+       - 제목, 날짜, 작성자, 본문, 마감일, 총개수, 리스트 배열 같은 게시물 메타데이터는 강한 정답 신호입니다.
+       - 커스텀 필드(예: ZZ_TITLE, ZZ_END_DT, article_title)도 제목/날짜 필드로 해석 가능하면 유효합니다.
+    2. 응답 형식이 아니라 실제 목록 증거를 우선합니다.
+       - JSON, JSONP, HTML 모두 실제 반복 레코드가 확인되면 동등한 데이터 원본입니다.
+       - has_repeated_records, semantic_record_count, title_date_pair_count를 강한 정답 신호로 사용하십시오.
+    3. 등록 대상 URL 자체도 정상적인 정답일 수 있습니다.
+       - is_exact_target=true이고 HTML 본문에 반복되는 제목·날짜 목록이 있으면 적극 선택하십시오.
+    4. score 는 참고만 하십시오.
+       - score 가 높더라도 sample 이 telemetry, 정적 스크립트, 검색 보조 API처럼 보이면 선택하지 마십시오.
+
+    판단 기준:
+    - sample 에 실제 목록 데이터가 보이는가?
+    - source_kind 가 데이터성 후보인가? (예: jsonp_javascript, xhr_json, post_json, graphql, form_post, bridge_javascript, script_data)
+    - body_shape 가 json_array, json_object, jsonp_wrapper 같은 구조인가?
+    - has_callback_param 이 있고 sample 에 제목/날짜 필드가 보이는가?
+    - data_key_hits, feature_summary 가 has_title_key, has_date_key, has_list_key, has_total_count 같은 강한 신호를 가지는가?
+
+    반드시 배제:
+    - telemetry, analytics, gtm, pixel, beacon, collect
+    - 정적 리소스(js 라이브러리, css, 이미지, 폰트)
+    - 자동완성, 해시태그 추천, UI 보조 API
+    - 로그, 설정, 공통 코드만 담은 응답
+    - looks_like_non_content=true이고 반복 목록 증거가 없는 응답
+
+    추가 규칙:
+    - jQuery(...), callback(...) 형태라도 내부에 제목/날짜/리스트/총개수 데이터가 보이면 JSONP 데이터 엔드포인트로 간주하십시오.
+    - content_type 이 javascript 이거나 오타가 있어도, sample 이 데이터성이면 내용 기준으로 판단하십시오.
+
+    출력 지침:
+    - 유효 후보가 있으면 index는 반드시 입력 후보 중 하나의 api_index여야 합니다.
+    - 모든 후보가 설정·인증·telemetry 등 비목록 응답이면 index=-1을 반환하십시오.
+    - reason 은 짧고 명확하게, 핵심 근거만 1~3개 포함하십시오.
+
+    [입력 데이터]
+    {api_list}

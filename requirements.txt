@@ -18,8 +18,8 @@ Requests==2.32.5          # 간단한 HTTP 요청 및 리다이렉션 추적용
 httpx==0.28.1             # 비동기(Async) HTTP 클라이언트 요청 처리
 
 # [인공지능 및 데이터 정제]
-google-genai              # Gemini AI를 사용하여 비정형 데이터를 정형 데이터로 변환
-protobuf==6.33.5          # 구글 API 통신을 위한 데이터 직렬화 라이브러리
+openai==2.49.0            # GPT-5 nano를 사용하여 애매한 API 후보를 선별
+protobuf==6.33.5          # Firebase 등 구글 서비스 데이터 직렬화
 
 # [데이터베이스 및 보안]
 psycopg[binary]==3.3.2    # PostgreSQL 데이터베이스와 통신하기 위한 드라이버

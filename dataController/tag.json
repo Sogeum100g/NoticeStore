@@ -1,0 +1,42 @@
+{
+  "notice_class_name":[
+    "list", "notice", "board", "data",
+    "content", "cont", "sub-content", "sub-cont",
+    "card", "Item", "item"
+  ],
+
+  "notice_tags" : [
+    "table", "ul", "article", "section"
+  ],
+  "trash_tags" : [
+    "script", "style", "nav", "footer",
+    "header", "aside", "input", "iframe",
+    "meta", "link", "img"
+  ],
+  "trash_extensions": [
+    ".css", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif",
+    ".mp4", ".webm", ".ogv",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".pdf", ".zip", ".hwp"
+  ],
+  "GLOBAL_TRASH_KEYWORDS" : [
+    "googleads", "doubleclick", "pixel", "analytics", "syndication",
+    "collect", "telemetry", "beacon", "click_protection", "window_focus",
+    "static", "assets", "fonts", "css", "jquery", "bootstrap",
+    "sodar", "runner", "sync", "cookie", "match", "ping", "opera", "zemanta", "mediago",
+    "beusable", "amplitude", "gtag", "gtm"
+  ],
+  "STATIC_CODE_KEYWORDS": [
+    "webpack", "framework-", "app-", "polyfills-", "runtime-", "vendor-",
+    "chunk-", "main-", "component-", "pages-", "manifest", "entry-",
+    "_next/", "react-", "vue-", "jquery", "lodash", "axios"
+  ],
+
+  "DATA_INDICATORS" : [
+    "api", "json", "graphql", "callback", "query=", "search",
+    "page=", "size=", "limit=", "offset=", "rows=", "count=",
+    "jobs", "recruit", "notice", "board", "fetch", "ajax", "joblist", "fo",
+    "list", "bbs", "svc", ".do"
+  ]
+}

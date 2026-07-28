@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 # 기존 임포트 유지
 from repositories.notice_repo import get_global_crawl_targets
-from scrape.dataController.scrape_auto import run_full_scrape
+from dataController.scraper.scrape_auto import run_full_scrape
 
 # DB 및 알림 서비스 임포트
 from repositories.user_repo import get_users_to_notify, get_notice_summary_for_user
