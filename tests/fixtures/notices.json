@@ -1,0 +1,20 @@
+{
+  "response": {
+    "items": [
+      {
+        "id": "notice-101",
+        "title": "첫 번째 장학금 신청 안내",
+        "department": "학생지원과",
+        "publishedAt": "2026-07-27",
+        "url": "/notices/101"
+      },
+      {
+        "id": "notice-100",
+        "title": "두 번째 학사 일정 변경 안내",
+        "department": "학사지원과",
+        "publishedAt": "2026-07-26",
+        "url": "/notices/100"
+      }
+    ]
+  }
+}
