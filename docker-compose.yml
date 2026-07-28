@@ -72,6 +72,9 @@ services:
       - .env
     environment:
       - TZ=Asia/Seoul  # 💡 추가: OS 레벨의 타임존 강제 지정
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
     # ports:
     #   - "5432:5432"
     # ports 설정 삭제: 보안을 위해 외부 노출 완벽 차단
@@ -82,7 +85,7 @@ services:
 
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
 
   # 6. 리버스 프록시 (새로 추가)

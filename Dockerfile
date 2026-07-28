@@ -1,5 +1,5 @@
 # 1. Playwright 공식 이미지 사용
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 # 2. 작업 디렉토리 설정
 WORKDIR /app

@@ -9,18 +9,42 @@ from repositories.db_manager import get_db_connection
 
 # --- [1. 사이트(Site) 및 크롤링 API 관리] ---
 
-def insert_site(site_url: str, created_at: datetime.datetime) -> Optional[int]:
+def insert_site(
+    site_url: str,
+    created_at: datetime.datetime,
+    *,
+    submitted_url: Optional[str] = None,
+    crawl_status: str = "pending",
+    validation_status: Optional[str] = None,
+    validation_error: Optional[str] = None,
+) -> Optional[int]:
     """새로운 사이트를 등록하고 생성된 site_id를 반환합니다."""
     conn = get_db_connection()
     if not conn: return None
     try:
         with conn.cursor() as cur:
             query = """
-                INSERT INTO sites (site_url, created_at)
-                VALUES (%s, %s)
+                INSERT INTO sites (
+                    site_url, created_at, submitted_url, crawl_status,
+                    validation_status, validation_error, last_validated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (site_url)
+                DO UPDATE SET
+                    submitted_url = COALESCE(sites.submitted_url, EXCLUDED.submitted_url)
                 RETURNING site_id;
             """
-            cur.execute(query, (site_url, created_at))
+            cur.execute(
+                query,
+                (
+                    site_url,
+                    created_at,
+                    submitted_url or site_url,
+                    crawl_status,
+                    validation_status,
+                    validation_error,
+                ),
+            )
             result = cur.fetchone()
             if result:
                 new_site_id = result[0]
@@ -65,6 +89,95 @@ def insert_api(site_id: int, method_type: str, api_url: str, headers: dict, payl
     finally:
         conn.close()
 
+
+def upsert_api_for_site(
+    site_id: int,
+    method_type: str,
+    api_url: str,
+    headers: dict,
+    payload: dict,
+    last_hash: str,
+    extractor_config: Optional[dict] = None,
+    schema_hash: Optional[str] = None,
+    processing_status: Optional[str] = None,
+    extractor_confidence: Optional[float] = None,
+) -> Optional[int]:
+    """사이트의 검증 완료 API를 저장하고 기존 오답 설정이 있으면 교체합니다."""
+    conn = get_db_connection()
+    if not conn or not site_id:
+        return None
+    try:
+        with conn.cursor() as cur:
+            update_query = """
+                UPDATE api
+                SET method_type = %s,
+                    api_url = %s,
+                    headers = %s,
+                    payload = %s,
+                    last_hash = %s,
+                    extractor_config = COALESCE(%s, extractor_config),
+                    schema_hash = COALESCE(%s, schema_hash),
+                    processing_status = COALESCE(%s, processing_status),
+                    extractor_confidence = COALESCE(%s, extractor_confidence),
+                    scraped_at = NOW()
+                WHERE site_id = %s
+                RETURNING api_id;
+            """
+            cur.execute(
+                update_query,
+                (
+                    method_type,
+                    api_url,
+                    Jsonb(headers or {}),
+                    Jsonb(payload or {}),
+                    last_hash,
+                    Jsonb(extractor_config) if extractor_config is not None else None,
+                    schema_hash,
+                    processing_status,
+                    extractor_confidence,
+                    site_id,
+                ),
+            )
+            updated = cur.fetchone()
+            if updated:
+                conn.commit()
+                return updated[0]
+
+            insert_query = """
+                INSERT INTO api (
+                    site_id, method_type, api_url, headers, payload,
+                    created_at, scraped_at, last_hash, extractor_config,
+                    schema_hash, processing_status, extractor_confidence
+                )
+                VALUES (%s, %s, %s, %s, %s, NOW(), NOW(), %s, %s, %s, %s, %s)
+                RETURNING api_id;
+            """
+            cur.execute(
+                insert_query,
+                (
+                    site_id,
+                    method_type,
+                    api_url,
+                    Jsonb(headers or {}),
+                    Jsonb(payload or {}),
+                    last_hash,
+                    Jsonb(extractor_config) if extractor_config is not None else None,
+                    schema_hash,
+                    processing_status,
+                    extractor_confidence,
+                ),
+            )
+            inserted = cur.fetchone()
+            conn.commit()
+            return inserted[0] if inserted else None
+    except Exception as e:
+        print(f"API 설정 upsert 중 에러 발생: {e}")
+        conn.rollback()
+        return None
+    finally:
+        conn.close()
+
+
 def update_api(api_url: str, last_hash: str):
     """크롤링 후 API의 해시값과 마지막 실행 시간을 갱신합니다."""
     conn = get_db_connection()
@@ -74,10 +187,16 @@ def update_api(api_url: str, last_hash: str):
             query = """
                 UPDATE api
                 SET last_hash = %s,
+                    last_observed_hash = %s,
+                    last_processed_hash = %s,
+                    processing_status = 'success',
+                    retry_count = 0,
+                    next_retry_at = NULL,
+                    last_error = NULL,
                     scraped_at = NOW()
                 WHERE api_url = %s;
             """
-            cur.execute(query, (last_hash, api_url))
+            cur.execute(query, (last_hash, last_hash, last_hash, api_url))
             conn.commit()
     except Exception as e:
         print(f"❌ API 업데이트 에러: {e}")
@@ -93,7 +212,11 @@ def select_api(target_url: str) -> Optional[Dict[str, Any]]:
         with conn.cursor(row_factory=dict_row) as cur:
             # SELECT 절에 s.site_id 를 명시적으로 추가했습니다.
             query = """
-                SELECT s.site_id, a.method_type, a.api_url, a.headers, a.payload, a.created_at
+                SELECT s.site_id, a.api_id, a.method_type, a.api_url,
+                       a.headers, a.payload, a.created_at, a.extractor_config,
+                       a.schema_hash, a.last_observed_hash,
+                       a.last_processed_hash, a.processing_status,
+                       a.retry_count, a.next_retry_at
                 FROM sites s
                 JOIN api a ON s.site_id = a.site_id
                 WHERE s.site_url = %s;
@@ -143,6 +266,299 @@ def select_last_hash(url: str) -> Optional[str]:
             else:
                 print(f"{url}에 해당하는 hash값이 없습니다.")
                 return None
+    finally:
+        conn.close()
+
+
+def select_processing_state(url: str) -> Dict[str, Any]:
+    """Return the split observation/processing cache state for one API."""
+    conn = get_db_connection()
+    if not conn:
+        return {}
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT api_id, last_hash, last_observed_hash,
+                       last_processed_hash, processing_status,
+                       retry_count, next_retry_at, last_error
+                FROM api
+                WHERE api_url = %s;
+                """,
+                (url,),
+            )
+            return cur.fetchone() or {}
+    finally:
+        conn.close()
+
+
+def update_api_processing_state(
+    api_url: str,
+    *,
+    observed_hash: str,
+    status: str,
+    processed_hash: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Persist success, valid-empty, or failed without conflating their hashes."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            if status == "failed":
+                cur.execute(
+                    """
+                    UPDATE api
+                    SET last_observed_hash = %s,
+                        processing_status = 'failed',
+                        retry_count = retry_count + 1,
+                        next_retry_at = NOW() + LEAST(
+                            INTERVAL '24 hours',
+                            INTERVAL '5 minutes' * POWER(2, LEAST(retry_count, 8))
+                        ),
+                        last_error = %s,
+                        scraped_at = NOW()
+                    WHERE api_url = %s;
+                    """,
+                    (observed_hash, error, api_url),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE api
+                    SET last_observed_hash = %s,
+                        last_processed_hash = %s,
+                        processing_status = %s,
+                        retry_count = 0,
+                        next_retry_at = NULL,
+                        last_error = NULL,
+                        scraped_at = NOW()
+                    WHERE api_url = %s;
+                    """,
+                    (
+                        observed_hash,
+                        processed_hash or observed_hash,
+                        status,
+                        api_url,
+                    ),
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"❌ API 처리 상태 업데이트 에러: {exc}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def update_api_extractor(
+    api_url: str,
+    *,
+    extractor_config: Dict[str, Any],
+    schema_hash: Optional[str],
+    confidence: Optional[float],
+) -> None:
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE api
+                SET extractor_config = %s,
+                    schema_hash = %s,
+                    extractor_confidence = %s
+                WHERE api_url = %s;
+                """,
+                (
+                    Jsonb(extractor_config),
+                    schema_hash,
+                    confidence,
+                    api_url,
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"❌ API 추출 규칙 업데이트 에러: {exc}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def update_site_crawl_state(
+    site_id: int,
+    *,
+    crawl_status: str,
+    validation_status: Optional[str] = None,
+    validation_error: Optional[str] = None,
+) -> None:
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE sites
+                SET crawl_status = %s,
+                    validation_status = COALESCE(%s, validation_status),
+                    validation_error = %s,
+                    last_validated_at = NOW()
+                WHERE site_id = %s;
+                """,
+                (crawl_status, validation_status, validation_error, site_id),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"❌ 사이트 상태 업데이트 에러: {exc}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def record_site_submission(
+    site_id: int,
+    *,
+    submitted_url: str,
+    validation_status: str = "valid",
+) -> None:
+    """Dual-write the submitted URL without resetting an already active site."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE sites
+                SET submitted_url = %s,
+                    crawl_status = COALESCE(crawl_status, 'pending'),
+                    validation_status = %s,
+                    validation_error = NULL,
+                    last_validated_at = NOW()
+                WHERE site_id = %s;
+                """,
+                (submitted_url, validation_status, site_id),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"❌ 사이트 등록 정보 업데이트 에러: {exc}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def create_crawl_run(
+    site_id: int,
+    *,
+    api_id: Optional[int] = None,
+    status: str = "running",
+    selection_mode: Optional[str] = None,
+    processing_mode: Optional[str] = None,
+    candidate_count: Optional[int] = None,
+    llm_used: bool = False,
+    llm_input_tokens: Optional[int] = None,
+    llm_output_tokens: Optional[int] = None,
+    llm_cost: Optional[float] = None,
+) -> Optional[int]:
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO crawl_runs (
+                    site_id, api_id, status, selection_mode, processing_mode,
+                    candidate_count, llm_used, llm_input_tokens,
+                    llm_output_tokens, llm_cost
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING crawl_run_id;
+                """,
+                (
+                    site_id,
+                    api_id,
+                    status,
+                    selection_mode,
+                    processing_mode,
+                    candidate_count,
+                    llm_used,
+                    llm_input_tokens,
+                    llm_output_tokens,
+                    llm_cost,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return row[0] if row else None
+    except Exception as exc:
+        print(f"❌ 크롤링 실행 이력 생성 에러: {exc}")
+        conn.rollback()
+        return None
+    finally:
+        conn.close()
+
+
+def finish_crawl_run(
+    crawl_run_id: Optional[int],
+    *,
+    status: str,
+    observed_hash: Optional[str] = None,
+    processed_hash: Optional[str] = None,
+    schema_hash: Optional[str] = None,
+    extracted_notice_count: Optional[int] = None,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+    llm_used: Optional[bool] = None,
+    llm_input_tokens: Optional[int] = None,
+    llm_output_tokens: Optional[int] = None,
+    llm_cost: Optional[float] = None,
+) -> None:
+    if not crawl_run_id:
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE crawl_runs
+                SET status = %s,
+                    observed_hash = %s,
+                    processed_hash = %s,
+                    schema_hash = %s,
+                    extracted_notice_count = %s,
+                    error_code = %s,
+                    error_message = %s,
+                    llm_used = COALESCE(%s, llm_used),
+                    llm_input_tokens = COALESCE(%s, llm_input_tokens),
+                    llm_output_tokens = COALESCE(%s, llm_output_tokens),
+                    llm_cost = COALESCE(%s, llm_cost),
+                    finished_at = NOW()
+                WHERE crawl_run_id = %s;
+                """,
+                (
+                    status,
+                    observed_hash,
+                    processed_hash,
+                    schema_hash,
+                    extracted_notice_count,
+                    error_code,
+                    error_message,
+                    llm_used,
+                    llm_input_tokens,
+                    llm_output_tokens,
+                    llm_cost,
+                    crawl_run_id,
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"❌ 크롤링 실행 이력 완료 처리 에러: {exc}")
+        conn.rollback()
     finally:
         conn.close()
 
@@ -203,7 +619,9 @@ def get_user_specific_sites(user_id: int) -> List[tuple]:
                             AND n.created_at > us.last_synced_at
                         ) THEN true
                         ELSE false 
-                    END as has_new
+                    END as has_new,
+                    COALESCE(s.crawl_status, 'active') AS crawl_status,
+                    s.validation_error
                     FROM user_subscriptions us
                     JOIN sites s ON us.site_id = s.site_id
                     WHERE us.user_id = %s;
@@ -216,10 +634,36 @@ def get_user_specific_sites(user_id: int) -> List[tuple]:
     finally:
         conn.close()
 
-def add_user_subscription(user_id: int, site_id: int, alias: str):
+
+def get_user_site_status(user_id: int, site_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT s.site_id, s.site_url,
+                       COALESCE(s.crawl_status, 'active') AS crawl_status,
+                       s.validation_status, s.validation_error,
+                       s.last_validated_at
+                FROM sites s
+                JOIN user_subscriptions us ON us.site_id = s.site_id
+                WHERE us.user_id = %s AND s.site_id = %s;
+                """,
+                (user_id, site_id),
+            )
+            return cur.fetchone()
+    except Exception as exc:
+        print(f"사이트 상태 조회 중 오류: {exc}")
+        return None
+    finally:
+        conn.close()
+
+def add_user_subscription(user_id: int, site_id: int, alias: str) -> bool:
     """사용자의 구독 목록에 사이트를 추가합니다. 중복 시 별명(alias)만 갱신합니다."""
     conn = get_db_connection()
-    if not conn: return
+    if not conn: return False
     try:
         with conn.cursor() as cur:
             query = """
@@ -230,9 +674,11 @@ def add_user_subscription(user_id: int, site_id: int, alias: str):
             """
             cur.execute(query, (user_id, site_id, alias))
             conn.commit()
+            return True
     except Exception as e:
         conn.rollback()
         print(f"구독 추가 중 오류 발생: {e}")
+        return False
     finally:
         conn.close()
 
@@ -279,36 +725,40 @@ def update_user_view_time(site_id: int, user_id: int):
 
 # --- [3. 공지사항(Notice) 관리] ---
 
-def insert_notice(site_id: int, title: str, author: str, url: str, created_at: datetime.datetime, scraped_at: datetime.datetime) -> Optional[int]:
-    """공지사항을 데이터베이스에 새로 저장합니다. 중복 시 무시(DO NOTHING)합니다."""
-    conn = get_db_connection()
-    if not conn: return None
-    try:
-        with conn.cursor() as cur:
-            query = """
-                INSERT INTO notices (site_id, title, author, url, created_at, scraped_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (site_id, title, author) DO NOTHING
-                RETURNING notice_id;
-            """
-            cur.execute(query, (site_id, title, author, url, created_at, scraped_at))
-            result = cur.fetchone()
-            if result:
-                new_notice_id = result[0]
-                conn.commit()
-                print(f"새 공지사항 저장 완료 (ID: {new_notice_id}), {title[:30]}")
-                return new_notice_id
-            else:
-                print(f"중복된 공지사항 건너뜀: {title[:20]}...")
-                return None
-    except Exception as e:
-        print(f"에러 발생: {e}")
-        conn.rollback()
-        return None
-    finally:
-        conn.close()
+def insert_notice(
+    site_id: int,
+    title: str,
+    author: str,
+    url: str,
+    created_at: datetime.datetime,
+    scraped_at: datetime.datetime,
+) -> Optional[int]:
+    """Compatibility wrapper using the valid (site_id, title) conflict key."""
+    return insert_or_update_notice(
+        site_id=site_id,
+        title=title,
+        author=author,
+        url=url,
+        created_at=created_at,
+        scraped_at=scraped_at,
+    )
 
-def insert_or_update_notice(site_id: int, title: str, author: str, url: str, created_at: datetime.datetime, scraped_at: datetime.datetime, is_active: bool = True):
+
+def insert_or_update_notice(
+    site_id: int,
+    title: str,
+    author: str,
+    url: str,
+    created_at: Optional[datetime.datetime],
+    scraped_at: datetime.datetime,
+    is_active: bool = True,
+    *,
+    detail_url: Optional[str] = None,
+    external_id: Optional[str] = None,
+    published_at: Optional[datetime.datetime] = None,
+    content_type: Optional[str] = None,
+    record_hash: Optional[str] = None,
+) -> Optional[int]:
     """
     공지사항을 저장하거나, 이미 존재할 경우 정보를 업데이트하고 활성화 상태로 변경합니다.
     (site_id, title) 제약 조건에 맞춰 작동하며, 제목의 공백을 정규화하여 중복을 방지합니다.
@@ -322,30 +772,111 @@ def insert_or_update_notice(site_id: int, title: str, author: str, url: str, cre
     clean_title = " ".join(title.split()).strip() if title else ""
     clean_author = author.strip() if author else ""
     clean_url = url.strip() if url else ""
-
-    # 💡 [안전장치] LLM이 날짜를 못 찾았을 경우, 수집 시점을 생성일로 간주합니다.
-    # 이렇게 하면 DB의 NOT NULL 제약조건을 지키면서 '최초 발견일' 원칙을 유지합니다.
-    final_created_at = created_at if created_at else scraped_at
+    clean_detail_url = detail_url.strip() if detail_url else None
+    clean_external_id = str(external_id).strip() if external_id is not None else None
 
     try:
         with conn.cursor() as cur:
-            # ON CONFLICT 대상에서 author를 제외하고 (site_id, title)만 사용합니다.
+            existing_notice_id = None
+            if clean_external_id:
+                cur.execute(
+                    """
+                    SELECT notice_id FROM notices
+                    WHERE site_id = %s AND external_id = %s;
+                    """,
+                    (site_id, clean_external_id),
+                )
+                row = cur.fetchone()
+                existing_notice_id = row[0] if row else None
+            if not existing_notice_id and clean_detail_url:
+                cur.execute(
+                    """
+                    SELECT notice_id FROM notices
+                    WHERE site_id = %s AND detail_url = %s;
+                    """,
+                    (site_id, clean_detail_url),
+                )
+                row = cur.fetchone()
+                existing_notice_id = row[0] if row else None
+
+            if existing_notice_id:
+                cur.execute(
+                    """
+                    UPDATE notices
+                    SET title = %s,
+                        author = %s,
+                        url = %s,
+                        detail_url = COALESCE(%s, detail_url),
+                        external_id = COALESCE(%s, external_id),
+                        published_at = COALESCE(%s, published_at),
+                        content_type = COALESCE(%s, content_type),
+                        record_hash = COALESCE(%s, record_hash),
+                        scraped_at = %s,
+                        is_active = %s
+                    WHERE notice_id = %s
+                    RETURNING notice_id;
+                    """,
+                    (
+                        clean_title,
+                        clean_author,
+                        clean_url,
+                        clean_detail_url,
+                        clean_external_id,
+                        published_at,
+                        content_type,
+                        record_hash,
+                        scraped_at,
+                        is_active,
+                        existing_notice_id,
+                    ),
+                )
+                row = cur.fetchone()
+                conn.commit()
+                return row[0] if row else existing_notice_id
+
             query = """
                 INSERT INTO notices (
-                    site_id, title, author, url, created_at, scraped_at, is_active
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    site_id, title, author, url, created_at, scraped_at, is_active,
+                    detail_url, external_id, published_at, content_type, record_hash
+                ) VALUES (%s, %s, %s, %s, COALESCE(%s, NOW()), %s, %s,
+                          %s, %s, %s, %s, %s)
                 ON CONFLICT (site_id, title) 
                 DO UPDATE SET 
-                    url = EXCLUDED.url,           -- 상세 URL이 확보되면 갱신되도록 포함
+                    author = EXCLUDED.author,
+                    url = EXCLUDED.url,
+                    detail_url = COALESCE(EXCLUDED.detail_url, notices.detail_url),
+                    external_id = COALESCE(EXCLUDED.external_id, notices.external_id),
+                    published_at = COALESCE(EXCLUDED.published_at, notices.published_at),
+                    content_type = COALESCE(EXCLUDED.content_type, notices.content_type),
+                    record_hash = COALESCE(EXCLUDED.record_hash, notices.record_hash),
                     scraped_at = EXCLUDED.scraped_at,
-                    is_active = EXCLUDED.is_active;
+                    is_active = EXCLUDED.is_active
+                RETURNING notice_id;
             """
-            cur.execute(query, (site_id, clean_title, clean_author, clean_url, final_created_at, scraped_at, is_active))
+            cur.execute(
+                query,
+                (
+                    site_id,
+                    clean_title,
+                    clean_author,
+                    clean_url,
+                    created_at,
+                    scraped_at,
+                    is_active,
+                    clean_detail_url,
+                    clean_external_id,
+                    published_at,
+                    content_type,
+                    record_hash,
+                ),
+            )
+            row = cur.fetchone()
             conn.commit()
-            
+            return row[0] if row else None
     except Exception as e:
         print(f"❌ 데이터 저장/업데이트 중 에러 발생: {e}")
         conn.rollback()
+        return None
     finally:
         conn.close()
 
@@ -378,7 +909,9 @@ def get_all_notices(url: str) -> List[tuple]:
     try:
         with conn.cursor() as cur:
             query = """
-                SELECT n.notice_id, n.title, n.author, n.url, n.created_at, n.scraped_at
+                SELECT n.notice_id, n.title, n.author,
+                       COALESCE(n.detail_url, n.url) AS url,
+                       n.created_at, n.scraped_at
                 FROM notices n
                 JOIN sites s ON n.site_id = s.site_id
                 WHERE s.site_url = %s AND n.is_active = true
@@ -413,7 +946,10 @@ def get_all_user_notices(user_id: int) -> List[dict]:
         # 💡 psycopg3의 row_factory=dict_row를 사용하여 결과를 딕셔너리로 받습니다.
         with conn.cursor(row_factory=dict_row) as cur:
             query = """
-                SELECT n.notice_id, n.title, n.author, n.url, n.created_at, n.scraped_at, n.site_id
+                SELECT n.notice_id, n.title, n.author,
+                       COALESCE(n.detail_url, n.url) AS url,
+                       n.created_at, n.scraped_at, n.site_id,
+                       n.published_at
                 FROM notices n
                 INNER JOIN user_subscriptions us ON n.site_id = us.site_id
                 WHERE us.user_id = %s
