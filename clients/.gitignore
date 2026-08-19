@@ -44,6 +44,14 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Secret Key Files
+.private/
+serviceAccountKey.json
+client_secret_*.json
+google-credentials.json
 .env
 *.env*
+!.env.example
 notice-store-firebase-adminsdk-fbsvc-dc41f1152a.json
+android/app/keystore.jks
+android/key.properties
