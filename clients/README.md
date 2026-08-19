@@ -1,83 +1,16 @@
-# 센트리피전 (Sentripigeon)
-> 파편화된 공개 공지 정보를 한곳에 모으고, 사용자가 원하는 키워드와 폴더 기준으로 정리해 알림까지 제공하는 지능형 정보 큐레이션 앱
+# app
 
-## 프로젝트 소개
+A new Flutter project.
 
-센트리피전은 여러 웹사이트에 흩어져 있는 **공개 공지사항**을 수집하고,
-사용자가 관심 있는 사이트를 구독하여 **즐겨찾기 / 폴더링 / 키워드 기반 관리 / 알림** 형태로 받아볼 수 있도록 설계한 모바일 애플리케이션입니다.
+## Getting Started
 
-학교 공지, 장학금, 사업단 프로그램, 채용 공고처럼
-정기적으로 확인해야 하지만 여러 사이트에 분산되어 있어 놓치기 쉬운 정보를
-하나의 앱에서 관리할 수 있도록 만드는 것이 목표입니다.
+This project is a starting point for a Flutter application.
 
----
+A few resources to get you started if this is your first Flutter project:
 
-## 문제 정의
+- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
 
-공개 공지 정보는 보통 다음과 같은 문제를 가집니다.
-
-- 사이트가 여러 곳에 흩어져 있음
-- 사용자가 직접 반복 방문해야 함
-- 중요한 공지를 놓치기 쉬움
-- 원하는 정보만 선별해서 보기 어려움
-- 저장, 분류, 다시 보기 기능이 부족함
-
-센트리피전은 이 문제를 다음 방식으로 해결합니다.
-
-- 사용자가 원하는 공지 사이트를 등록
-- 공지 목록을 주기적으로 수집
-- 앱에서 사이트별로 구독 관리
-- 공지를 폴더/키워드 기준으로 정리
-- 새 공지 발생 시 알림 제공
-
----
-
-## 주요 기능
-
-### 1. 사이트 등록 및 구독
-- 사용자가 공개 공지 사이트 URL을 등록
-- 등록된 사이트를 구독 목록으로 관리
-- 사이트별 별칭(alias) 부여 가능
-
-### 2. 공지 수집 및 저장
-- 사이트별 공지 목록을 수집하여 저장
-- 수집 결과를 앱에서 목록 형태로 제공
-- 중복 공지 판별 및 활성 상태 관리
-
-### 3. 개인화 기능
-- 즐겨찾기 폴더 생성
-- 폴더별 키워드 등록
-- 공지 숨김 처리
-- 즐겨찾기 공지 저장
-
-### 4. 알림 기능
-- 사용자별 알림 사용 여부 설정
-- 새 공지 감지 시 푸시 알림 전송
-- 사용자/기기별 FCM 토큰 관리
-
-### 5. 문의 및 운영 확장성
-- 사용자 문의 기능
-- 추천인(referral) 구조 고려
-- 향후 고도화 가능한 데이터 구조 설계
-
----
-
-## 대상 사용자
-
-- 학교 공지, 장학 공지, 사업단 프로그램을 자주 확인해야 하는 학생
-- 여러 기관/사이트의 공지사항을 빠르게 모아보고 싶은 사용자
-- 특정 키워드가 포함된 공지를 놓치고 싶지 않은 사용자
-
----
-
-## 시스템 아키텍처
-
-```mermaid
-flowchart LR
-    A[Flutter App] --> B[FastAPI Backend]
-    B --> C[Scraping Orchestrator]
-    C --> D[Public Notice Site]
-    C --> E[(PostgreSQL)]
-    B --> E
-    B --> F[Firebase Cloud Messaging]
-    F --> A
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.

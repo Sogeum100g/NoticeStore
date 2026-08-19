@@ -9,38 +9,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.3.59"
-  app_links:
-    dependency: "direct main"
-    description:
-      name: app_links
-      sha256: "3462d9defc61565fde4944858b59bec5be2b9d5b05f20aed190adb3ad08a7abc"
-      url: "https://pub.dev"
-    source: hosted
-    version: "7.0.0"
-  app_links_linux:
-    dependency: transitive
-    description:
-      name: app_links_linux
-      sha256: f5f7173a78609f3dfd4c2ff2c95bd559ab43c80a87dc6a095921d96c05688c81
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.3"
-  app_links_platform_interface:
-    dependency: transitive
-    description:
-      name: app_links_platform_interface
-      sha256: "05f5379577c513b534a29ddea68176a4d4802c46180ee8e2e966257158772a3f"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.0.2"
-  app_links_web:
-    dependency: transitive
-    description:
-      name: app_links_web
-      sha256: af060ed76183f9e2b87510a9480e56a5352b6c249778d07bd2c95fc35632a555
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.0.4"
   archive:
     dependency: transitive
     description:
@@ -121,14 +89,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.19.1"
-  cross_file:
-    dependency: transitive
-    description:
-      name: cross_file
-      sha256: "28bb3ae56f117b5aec029d702a90f57d285cd975c3c5c281eaca38dbc47c5937"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.3.5+2"
   crypto:
     dependency: transitive
     description:
@@ -153,22 +113,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.7.12"
-  device_info_plus:
-    dependency: "direct main"
-    description:
-      name: device_info_plus
-      sha256: a7fd703482b391a87d60b6061d04dfdeab07826b96f9abd8f5ed98068acc0074
-      url: "https://pub.dev"
-    source: hosted
-    version: "10.1.2"
-  device_info_plus_platform_interface:
-    dependency: transitive
-    description:
-      name: device_info_plus_platform_interface
-      sha256: e1ea89119e34903dca74b883d0dd78eb762814f97fb6c76f35e9ff74d261a18f
-      url: "https://pub.dev"
-    source: hosted
-    version: "7.0.3"
   dio:
     dependency: "direct main"
     description:
@@ -185,14 +129,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.1"
-  extension_google_sign_in_as_googleapis_auth:
-    dependency: transitive
-    description:
-      name: extension_google_sign_in_as_googleapis_auth
-      sha256: "0dcb17e399f62e897ac78f0a402a3cb6ab9313ced8b2bf131f684d317e05c9ab"
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.0.13"
   fake_async:
     dependency: transitive
     description:
@@ -413,38 +349,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "6.3.0"
-  google_sign_in_all_platforms:
-    dependency: "direct main"
-    description:
-      name: google_sign_in_all_platforms
-      sha256: f58c730be166aa151b5b230cb92dbade145579f1b770ca120ee9356aaa403178
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.2.1"
-  google_sign_in_all_platforms_desktop:
-    dependency: transitive
-    description:
-      name: google_sign_in_all_platforms_desktop
-      sha256: "89804d39d215e70e3f69ccc2ad7f6a4dce1287fd9d4c8f6f1397b52a36d42cb3"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.0.2"
-  google_sign_in_all_platforms_interface:
-    dependency: transitive
-    description:
-      name: google_sign_in_all_platforms_interface
-      sha256: "7970f9ea565c0d145ef6dfaf0b6108b4ee1b95918885bf5f78c5a91e1d9bccaf"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.0.6"
-  google_sign_in_all_platforms_mobile:
-    dependency: transitive
-    description:
-      name: google_sign_in_all_platforms_mobile
-      sha256: "9505801e27f74ada2bfeda5cc1255b2307c688a321773c20fa2248f23d93f044"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.0.2"
   google_sign_in_android:
     dependency: transitive
     description:
@@ -477,22 +381,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.12.4+4"
-  googleapis_auth:
-    dependency: transitive
-    description:
-      name: googleapis_auth
-      sha256: befd71383a955535060acde8792e7efc11d2fccd03dd1d3ec434e85b68775938
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.6.0"
-  gtk:
-    dependency: transitive
-    description:
-      name: gtk
-      sha256: e8ce9ca4b1df106e4d72dad201d345ea1a036cc12c360f1a7d5a758f78ffa42c
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.1.0"
   hooks:
     dependency: transitive
     description:
@@ -509,14 +397,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.6.0"
-  http_methods:
-    dependency: transitive
-    description:
-      name: http_methods
-      sha256: "6bccce8f1ec7b5d701e7921dca35e202d425b57e317ba1a37f2638590e29e566"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.1.1"
   http_parser:
     dependency: transitive
     description:
@@ -765,22 +645,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.8.1"
-  share_plus:
-    dependency: "direct main"
-    description:
-      name: share_plus
-      sha256: "14c8860d4de93d3a7e53af51bff479598c4e999605290756bbbe45cf65b37840"
-      url: "https://pub.dev"
-    source: hosted
-    version: "12.0.1"
-  share_plus_platform_interface:
-    dependency: transitive
-    description:
-      name: share_plus_platform_interface
-      sha256: "88023e53a13429bd65d8e85e11a9b484f49d4c190abbd96c7932b74d6927cc9a"
-      url: "https://pub.dev"
-    source: hosted
-    version: "6.1.0"
   shared_preferences:
     dependency: "direct main"
     description:
@@ -837,22 +701,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.4.1"
-  shelf:
-    dependency: transitive
-    description:
-      name: shelf
-      sha256: e7dd780a7ffb623c57850b33f43309312fc863fb6aa3d276a754bb299839ef12
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.4.2"
-  shelf_router:
-    dependency: transitive
-    description:
-      name: shelf_router
-      sha256: f5e5d492440a7fb165fe1e2e1a623f31f734d3370900070b2b1e0d0428d59864
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.1.4"
   simple_gesture_detector:
     dependency: transitive
     description:
@@ -1042,14 +890,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "5.15.0"
-  win32_registry:
-    dependency: transitive
-    description:
-      name: win32_registry
-      sha256: "21ec76dfc731550fd3e2ce7a33a9ea90b828fdf19a5c3bcf556fa992cfa99852"
-      url: "https://pub.dev"
-    source: hosted
-    version: "1.1.5"
   xdg_directories:
     dependency: transitive
     description:
