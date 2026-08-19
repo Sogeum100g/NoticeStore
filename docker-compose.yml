@@ -30,23 +30,40 @@ services:
     # ports 설정 삭제: 도커 내부 네트워크를 통해서만 접근 가능하도록 격리
 
 
-  # 3. Celery 워커 (볼륨 추가)
-  celery_worker:
+  # 3. 크롤링 전용 Celery 워커
+  crawler_worker:
     build: .
-    container_name: noticestore_celery_worker
+    container_name: noticestore_crawler_worker
     restart: always
     volumes:
-      - .:/app  # 워커 코드도 실시간 동기화
-    command: celery -A celery_app worker --loglevel=info
+      - .:/app
+    # Playwright 작업의 자원 독점을 막기 위해 동시성과 prefetch를 제한합니다.
+    command: celery -A celery_app worker --loglevel=info --queues=crawl --concurrency=2 --prefetch-multiplier=1
     environment:
-      - TZ=Asia/Seoul  # 💡 추가: OS 레벨의 타임존 강제 지정
+      - TZ=Asia/Seoul
     env_file:
       - .env
     depends_on:
       - db
       - redis
 
-  # 4. Celery 비트 (볼륨 추가)
+  # 4. 알림 전용 Celery 워커
+  notification_worker:
+    build: .
+    container_name: noticestore_notification_worker
+    restart: always
+    volumes:
+      - .:/app
+    command: celery -A celery_app worker --loglevel=info --queues=notification --concurrency=2
+    environment:
+      - TZ=Asia/Seoul
+    env_file:
+      - .env
+    depends_on:
+      - db
+      - redis
+
+  # 5. Celery 비트
   celery_beat:
     build: .
     container_name: noticestore_celery_beat
@@ -63,7 +80,7 @@ services:
       - db
       - redis
 
-  # 5. 데이터베이스
+  # 6. 데이터베이스
   db:
     image: postgres:15
     container_name: noticestore-db
@@ -88,7 +105,7 @@ services:
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
 
-  # 6. 리버스 프록시 (새로 추가)
+  # 7. 리버스 프록시 (새로 추가)
   nginx:
     image: nginx:latest
     container_name: noticestore-nginx

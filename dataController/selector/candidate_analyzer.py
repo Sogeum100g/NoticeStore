@@ -51,7 +51,7 @@ GENERIC_LINK_TEXTS = {
     "공지사항", "업데이트", "이벤트", "전체", "공지", "점검", "이전", "다음",
     "read more", "learn more", "view more", "자세히 보기", "더보기",
 }
-RECORD_CONTAINER_TAGS = {"li", "article", "tr"}
+RECORD_CONTAINER_TAGS = {"li", "article", "tr", "ul", "ol", "dl"}
 RECORD_CLASS_HINTS = {
     "article", "board", "card", "entry", "item", "list", "news", "notice",
     "post", "release", "result", "row",
@@ -64,26 +64,56 @@ def _normalize_key(key: Any) -> str:
 
 
 def _key_category(key: Any) -> Optional[str]:
+    categories = _key_categories(key)
+    return next(iter(categories), None)
+
+
+def _key_categories(key: Any) -> Set[str]:
     normalized = _normalize_key(key)
+    categories: Set[str] = set()
     if normalized in TITLE_KEY_ALIASES:
-        return "title"
+        categories.add("title")
     if normalized in DATE_KEY_ALIASES:
-        return "date"
+        categories.add("date")
     if normalized in COUNT_KEY_ALIASES:
-        return "count"
+        categories.add("count")
     if normalized in LIST_KEY_ALIASES:
-        return "list"
-    return None
+        categories.add("list")
+
+    tokens = [token for token in normalized.split("_") if token]
+    last_token = tokens[-1] if tokens else ""
+    if last_token in {"title", "subject", "headline"}:
+        categories.add("title")
+    if last_token in {
+        "date", "datetime", "timestamp", "at", "dt", "ymd",
+    } and any(
+        token in {
+            "apply", "created", "deadline", "display", "end", "modified",
+            "posted", "published", "reg", "start", "updated", "upt",
+        }
+        for token in tokens[:-1]
+    ):
+        categories.add("date")
+    if last_token in {"list", "items", "rows", "results"}:
+        categories.add("list")
+    if last_token in {"count", "cnt"}:
+        categories.add("count")
+    return categories
 
 
 def _record_strength(value: Dict[str, Any]) -> Tuple[bool, bool]:
     normalized_keys = {_normalize_key(key) for key in value}
-    has_title = bool(normalized_keys & TITLE_KEY_ALIASES)
+    key_categories = {
+        category
+        for key in value
+        for category in _key_categories(key)
+    }
+    has_title = "title" in key_categories
     has_supporting_field = bool(
-        normalized_keys
+        "date" in key_categories
+        or normalized_keys
         & (
-            DATE_KEY_ALIASES
-            | AUTHOR_KEY_ALIASES
+            AUTHOR_KEY_ALIASES
             | URL_KEY_ALIASES
             | CONTENT_KEY_ALIASES
         )
@@ -104,9 +134,7 @@ def _walk_structured_data(value: Any) -> Tuple[Set[str], int, int, List[Dict[str
         if isinstance(node, dict):
             normalized_keys = {_normalize_key(key) for key in node}
             for key in node:
-                category = _key_category(key)
-                if category:
-                    key_hits.add(category)
+                key_hits.update(_key_categories(key))
 
             if normalized_keys & TITLE_KEY_ALIASES:
                 key_hits.add("title")
@@ -125,8 +153,12 @@ def _walk_structured_data(value: Any) -> Tuple[Set[str], int, int, List[Dict[str
                 has_title, has_supporting = _record_strength(item)
                 if has_title and has_supporting:
                     strong_records.append(item)
-                normalized_keys = {_normalize_key(key) for key in item}
-                if normalized_keys & TITLE_KEY_ALIASES and normalized_keys & DATE_KEY_ALIASES:
+                item_categories = {
+                    category
+                    for key in item
+                    for category in _key_categories(key)
+                }
+                if {"title", "date"} <= item_categories:
                     title_date_pairs += 1
 
             if len(strong_records) > max_record_count:

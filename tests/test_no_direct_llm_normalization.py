@@ -18,17 +18,14 @@ class NoDirectLlmNormalizationTests(unittest.TestCase):
 
     def test_data_processing_has_no_gemini_dependency(self):
         project_root = Path(__file__).resolve().parents[1]
-        production_sources = "\n".join(
+        scraper_sources = "\n".join(
             path.read_text(encoding="utf-8")
-            for path in (project_root / "dataController").rglob("*.py")
-        )
-        requirements = (project_root / "requirements.txt").read_text(
-            encoding="utf-8"
+            for path in (project_root / "dataController" / "scraper").rglob("*.py")
         )
 
-        self.assertNotIn("GEMINI_API_KEY_DATA_PROCESSING", production_sources)
-        self.assertNotIn("google.genai", production_sources)
-        self.assertNotIn("google-genai", requirements)
+        self.assertNotIn("GEMINI_API_KEY_DATA_PROCESSING", scraper_sources)
+        self.assertNotIn("google.genai", scraper_sources)
+        self.assertNotIn("from google import genai", scraper_sources)
 
 
 class FailedExtractionPipelineTests(unittest.IsolatedAsyncioTestCase):

@@ -13,7 +13,8 @@ from routers import (
     folder_router,
     notice_router,
     subscription_router,
-    inquiry_router
+    inquiry_router,
+    crawl_admin_router,
 )
 
 load_dotenv()
@@ -44,6 +45,7 @@ v1_router.include_router(folder_router.router)
 v1_router.include_router(notice_router.router)
 v1_router.include_router(subscription_router.router)
 v1_router.include_router(inquiry_router.router)
+v1_router.include_router(crawl_admin_router.router)
 
 app.include_router(v1_router)
 

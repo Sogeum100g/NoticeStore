@@ -3,7 +3,13 @@ import httpx
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, status
 
-from repositories.inquiry_repo import insert_inquiry, get_user_inquiries, get_inquiry_by_id, update_inquiry_reply
+from repositories.inquiry_repo import (
+    get_inquiry_by_id,
+    get_user_inquiries,
+    get_user_inquiry_site_context,
+    insert_inquiry,
+    update_inquiry_reply,
+)
 from repositories.user_repo import get_user_fcm_tokens, get_user_info_by_id
 # 분리해둔 스키마 및 의존성 임포트
 from schemas import InquiryRequest, ReplyRequest
@@ -17,23 +23,46 @@ router = APIRouter(tags=["Inquiries"])
 
 # --- [도움 함수: 외부 알림] ---
 
-async def send_discord_notification(category: str, title: str, content: str, email: str, nickname: str):
+async def send_discord_notification(
+    category: str,
+    title: str,
+    content: str,
+    email: str,
+    nickname: str,
+    site_context: dict | None = None,
+):
     """새로운 문의 접수 시 디스코드 웹훅을 통해 관리자에게 실시간 알림을 보냅니다."""
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
     if not webhook_url:
         return
 
+    fields = [
+        {"name": "분류", "value": category, "inline": True},
+        {"name": "이메일", "value": email or "-", "inline": True},
+        {"name": "작성자", "value": nickname or "-", "inline": True},
+        {"name": "제목", "value": title, "inline": False},
+        {"name": "내용", "value": content, "inline": False},
+    ]
+    if site_context:
+        fields.append(
+            {
+                "name": "연결된 크롤링",
+                "value": (
+                    f"site_id={site_context.get('site_id')} | "
+                    f"site_status={site_context.get('crawl_status')} | "
+                    f"crawl_run_id={site_context.get('crawl_run_id') or '-'} | "
+                    f"run_status={site_context.get('crawl_run_status') or '-'} | "
+                    f"error_code={site_context.get('error_code') or '-'}"
+                ),
+                "inline": False,
+            }
+        )
+
     payload = {
         "embeds": [{
             "title": "📌 새로운 1:1 문의가 접수되었습니다!",
             "color": 0x3498db,
-            "fields": [
-                {"name": "분류", "value": category, "inline": True},
-                {"name": "이메일", "value": email, "inline": True},
-                {"name": "작성자", "value": nickname, "inline": True},
-                {"name": "제목", "value": title, "inline": False},
-                {"name": "내용", "value": content, "inline": False},
-            ],
+            "fields": fields,
             "footer": {"text": "센트리피전 관리 시스템"},
             "timestamp": datetime.now(timezone.utc).isoformat()
         }]
@@ -51,7 +80,7 @@ async def submit_inquiry(
     user_id: int = Depends(get_current_user_id)
 ):
     """사용자가 새로운 문의를 등록합니다. 서버 부하 방지를 위해 디스코드 알림은 백그라운드 태스크로 처리합니다."""
-    user_info = get_user_info_by_id(user_id)
+    user_info = get_user_info_by_id(user_id) or {}
     # 1. DB의 email, nickname 필드 확인
     email = user_info.get('email')
     nickname = user_info.get('nickname')
@@ -64,14 +93,48 @@ async def submit_inquiry(
             nickname = email.split('@')[0]
             
 
-    success = insert_inquiry(user_id, request.category, request.title, request.content)
+    site_context = None
+    if request.site_id is not None:
+        site_context = get_user_inquiry_site_context(
+            user_id,
+            request.site_id,
+        )
+        if not site_context:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="SUBSCRIBED_SITE_NOT_FOUND",
+            )
+
+    success = insert_inquiry(
+        user_id,
+        request.category,
+        request.title,
+        request.content,
+        site_id=request.site_id,
+        crawl_run_id=(
+            site_context.get("crawl_run_id") if site_context else None
+        ),
+    )
 
     if success:
         background_tasks.add_task(
             send_discord_notification,
-            request.category, request.title, request.content, email, nickname
+            request.category,
+            request.title,
+            request.content,
+            email,
+            nickname,
+            site_context,
         )
-        return {"status": "success"}
+        return {
+            "status": "success",
+            "site_id": request.site_id,
+            "crawl_run_id": (
+                site_context.get("crawl_run_id")
+                if site_context
+                else None
+            ),
+        }
     else:
         raise HTTPException(status_code=500, detail="문의 저장에 실패했습니다.")
 

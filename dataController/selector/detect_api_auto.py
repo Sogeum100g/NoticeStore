@@ -1,11 +1,12 @@
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlencode
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pytz
 import requests
@@ -26,7 +27,11 @@ from dataController.security.url_safety import (
 from dataController.selector.candidate_analyzer import analyze_candidate_body
 from dataController.selector.candidate_collector import collect_candidates
 from dataController.selector.candidate_ranker import build_candidate_pool, rank_candidates
-from dataController.selector.candidate_selector import prioritize_candidates
+from dataController.selector.candidate_selector import (
+    LLM_TOP_K,
+    classify_candidate_decision,
+    prioritize_candidates,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,6 +47,117 @@ TEXTUAL_CONTENT_TYPE_HINTS = (
 )
 MAX_VALIDATION_CANDIDATES = 8
 MAX_VALIDATION_BODY_BYTES = 700_000
+MAX_EVIDENCE_REASON_LENGTH = 500
+
+
+def _redact_candidate_url(url: str) -> str:
+    """Keep endpoint shape for review without persisting query values or fragments."""
+    try:
+        parsed = urlsplit(url or "")
+        hostname = parsed.hostname or ""
+        if ":" in hostname and not hostname.startswith("["):
+            hostname = f"[{hostname}]"
+        netloc = hostname
+        if parsed.port is not None:
+            netloc = f"{hostname}:{parsed.port}"
+        query_keys = sorted(
+            {
+                key
+                for key, _ in parse_qsl(
+                    parsed.query,
+                    keep_blank_values=True,
+                )
+            }
+        )
+        redacted_query = urlencode([(key, "") for key in query_keys])
+        return urlunsplit(
+            (
+                parsed.scheme.lower(),
+                netloc,
+                parsed.path,
+                redacted_query,
+                "",
+            )
+        )
+    except (TypeError, ValueError):
+        return ""
+
+
+def build_candidate_evidence(
+    candidates: List[Dict[str, Any]],
+    *,
+    selected_candidate_index: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Build bounded, JSON-safe candidate telemetry for later calibration."""
+    evidence: List[Dict[str, Any]] = []
+    for rank, candidate in enumerate(
+        candidates[:MAX_VALIDATION_CANDIDATES],
+        start=1,
+    ):
+        raw_url = str(candidate.get("api_url") or "")
+        redacted_url = _redact_candidate_url(raw_url)
+        validation_reason = str(candidate.get("validation_reason") or "")
+        if raw_url:
+            validation_reason = validation_reason.replace(
+                raw_url,
+                redacted_url,
+            )
+        evidence.append(
+            {
+                "rank": rank,
+                "api_index": candidate.get("api_index"),
+                "selected": (
+                    selected_candidate_index is not None
+                    and candidate.get("api_index") == selected_candidate_index
+                ),
+                "method_type": candidate.get("method_type") or "GET",
+                "source_kind": candidate.get("source_kind"),
+                "endpoint": redacted_url,
+                "url_hash": hashlib.sha256(
+                    raw_url.encode("utf-8")
+                ).hexdigest(),
+                "score": candidate.get("score"),
+                "score_reasons": list(
+                    candidate.get("score_reasons") or []
+                )[:20],
+                "features": dict(candidate.get("features") or {}),
+                "validation_status": (
+                    candidate.get("validation_status")
+                    or "not_replayed"
+                ),
+                "validation_reason": validation_reason[
+                    :MAX_EVIDENCE_REASON_LENGTH
+                ],
+            }
+        )
+    return evidence
+
+
+def _record_selection_failure(
+    site_id: int,
+    *,
+    candidate_count: int,
+    selection_decision: str,
+    selection_reason: str,
+    candidates: Optional[List[Dict[str, Any]]] = None,
+    error_code: str,
+) -> None:
+    crawl_run_id = notice_repo.create_crawl_run(
+        site_id,
+        status="running",
+        selection_mode="none",
+        processing_mode="candidate_selection",
+        candidate_count=candidate_count,
+        selection_decision=selection_decision,
+        selection_reason=selection_reason,
+        candidate_evidence=build_candidate_evidence(candidates or []),
+    )
+    notice_repo.finish_crawl_run(
+        crawl_run_id,
+        status="failed",
+        error_code=error_code,
+        error_message=selection_reason,
+    )
 
 
 def save_site(url: str) -> Optional[int]:
@@ -257,6 +373,19 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
 
     if not candidates:
         logger.warning("수집된 API 후보가 없습니다.")
+        _record_selection_failure(
+            site_id,
+            candidate_count=0,
+            selection_decision="reject_or_observe_more",
+            selection_reason="수집된 API 후보가 없습니다.",
+            error_code="NO_CANDIDATES",
+        )
+        notice_repo.update_site_crawl_state(
+            site_id,
+            crawl_status="failed",
+            validation_status="valid",
+            validation_error="수집된 API 후보가 없습니다.",
+        )
         return None
 
     ranked_candidates = rank_candidates(candidates, target_url)
@@ -295,20 +424,51 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
 
     if not validated_candidates:
         logger.warning("보안·재현·의미 gate를 통과한 후보가 없습니다.")
+        failure_reason = "API 후보 사전 검증에 실패했습니다."
+        _record_selection_failure(
+            site_id,
+            candidate_count=len(candidates),
+            selection_decision="reject_or_observe_more",
+            selection_reason=failure_reason,
+            candidates=replay_pool,
+            error_code="CANDIDATE_VALIDATION_FAILED",
+        )
         notice_repo.update_site_crawl_state(
             site_id,
             crawl_status="failed",
             validation_status="valid",
-            validation_error="API 후보 사전 검증에 실패했습니다.",
+            validation_error=failure_reason,
         )
         return None
 
+    decision_pool = build_candidate_pool(
+        validated_candidates,
+        target_url,
+        limit=LLM_TOP_K,
+    )
+    selection_decision, selection_reason = classify_candidate_decision(
+        decision_pool
+    )
     prioritized_candidates = await prioritize_candidates(
         validated_candidates,
         target_url=target_url,
     )
     if not prioritized_candidates:
         logger.warning("후보 선택에 실패했습니다.")
+        _record_selection_failure(
+            site_id,
+            candidate_count=len(candidates),
+            selection_decision=selection_decision,
+            selection_reason=selection_reason,
+            candidates=replay_pool,
+            error_code="CANDIDATE_SELECTION_FAILED",
+        )
+        notice_repo.update_site_crawl_state(
+            site_id,
+            crawl_status="failed",
+            validation_status="valid",
+            validation_error=selection_reason,
+        )
         return None
 
     selected_api = prioritized_candidates[0]
@@ -321,6 +481,16 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
     selected_api["site_id"] = site_id
     selected_api["_candidate_count"] = len(candidates)
     selected_api["_llm_used"] = selected_api.get("selection_mode") == "llm"
+    selected_api["selection_decision"] = (
+        selected_api.get("selection_decision") or selection_decision
+    )
+    selected_api["selection_reason"] = (
+        selected_api.get("selection_reason") or selection_reason
+    )
+    selected_api["_candidate_evidence"] = build_candidate_evidence(
+        replay_pool,
+        selected_candidate_index=selected_api.get("api_index"),
+    )
     selected_api["_pending_persistence"] = True
     notice_repo.update_site_crawl_state(
         site_id,

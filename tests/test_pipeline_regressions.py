@@ -10,7 +10,12 @@ from dataController.scraper.processing_state import (
     classify_processing_result,
     decide_observation,
 )
-from dataController.scraper.scrape_auto import run_full_scrape
+from dataController.scraper.scrape_auto import (
+    _extraction_coverage_error,
+    _refresh_html_extractor_decision,
+    run_full_scrape,
+)
+from dataController.scraper.deterministic_extractor import ExtractionResult
 from dataController.selector.candidate_analyzer import analyze_candidate_body
 from dataController.selector.detect_api_auto import find_api, validate_candidate
 
@@ -141,6 +146,72 @@ class ProcessingStateRegressionTests(unittest.TestCase):
         )
         self.assertEqual(decision, "retry_exhausted")
 
+    def test_old_html_extractor_rule_reprocesses_unchanged_source(self):
+        decision = _refresh_html_extractor_decision(
+            "unchanged",
+            {
+                "extractor_config": {
+                    "version": 2,
+                    "source_type": "html",
+                    "record_css": "ul.card_list > li",
+                }
+            },
+        )
+        self.assertEqual(decision, "process")
+
+    def test_current_html_extractor_rule_keeps_unchanged_decision(self):
+        decision = _refresh_html_extractor_decision(
+            "unchanged",
+            {
+                "extractor_config": {
+                    "version": 4,
+                    "source_type": "html",
+                    "record_css": "ul.card_list > li",
+                }
+            },
+        )
+        self.assertEqual(decision, "unchanged")
+
+    def test_large_semantic_to_extraction_drop_is_rejected(self):
+        error = _extraction_coverage_error(
+            {
+                "validation_analysis": {
+                    "semantic_record_count": 9,
+                }
+            },
+            ExtractionResult(
+                status="success",
+                notices=[{"title": "첫 공고"}],
+                extractor_config=None,
+                schema_hash=None,
+                confidence=0.82,
+                intermediate=None,
+            ),
+        )
+        self.assertIn("semantic_records=9", error)
+        self.assertIn("extracted_records=1", error)
+
+    def test_matching_semantic_and_extraction_counts_are_accepted(self):
+        error = _extraction_coverage_error(
+            {
+                "validation_analysis": {
+                    "semantic_record_count": 14,
+                }
+            },
+            ExtractionResult(
+                status="success",
+                notices=[
+                    {"title": f"공지 {index}"}
+                    for index in range(14)
+                ],
+                extractor_config=None,
+                schema_hash=None,
+                confidence=0.96,
+                intermediate=None,
+            ),
+        )
+        self.assertIsNone(error)
+
 
 class RawHashCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_processed_json_hash_skips_extraction(self):
@@ -195,7 +266,7 @@ class RawHashCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
             patch(
                 "dataController.scraper.scrape_auto.notice_repo.create_crawl_run",
                 return_value=11,
-            ),
+            ) as create_run,
             patch(
                 "dataController.scraper.scrape_auto.notice_repo.finish_crawl_run",
             ),
@@ -211,6 +282,9 @@ class RawHashCacheRegressionTests(unittest.IsolatedAsyncioTestCase):
             result = await run_full_scrape("https://public.example/notices")
 
         self.assertEqual(result["status"], "unchanged")
+        create_kwargs = create_run.call_args.kwargs
+        self.assertEqual(create_kwargs["selection_decision"], "cached_reuse")
+        self.assertIsNone(create_kwargs["candidate_evidence"])
 
     def test_structuring_error_is_failed_not_valid_empty(self):
         status, error = classify_processing_result(
@@ -262,6 +336,57 @@ class StoredFixtureRegressionTests(unittest.TestCase):
         )
         self.assertTrue(analysis["has_repeated_records"])
         self.assertEqual(analysis["semantic_record_count"], 2)
+
+    def test_split_cell_list_rows_are_semantic_records(self):
+        html = """
+        <div class="tb-body">
+          <ul>
+            <li><a href="#a">첫 번째 학사 공지 안내</a></li>
+            <li>컴퓨터과학부</li>
+            <li>2026-07-23</li>
+          </ul>
+          <ul>
+            <li><a href="#a">두 번째 학사 공지 안내</a></li>
+            <li>컴퓨터과학부</li>
+            <li>2026-07-15</li>
+          </ul>
+        </div>
+        """
+        analysis = analyze_candidate_body(
+            html,
+            body_shape="html",
+            content_type="text/html",
+        )
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 2)
+
+    def test_camel_case_structured_roles_are_semantic_records(self):
+        analysis = analyze_candidate_body(
+            json.dumps(
+                {
+                    "jobList": [
+                        {
+                            "realId": "P-100",
+                            "jobOfferTitle": "AI Platform Engineer",
+                            "regDate": "2026-07-20T10:00:00",
+                        },
+                        {
+                            "realId": "P-101",
+                            "jobOfferTitle": "Data Platform Engineer",
+                            "regDate": "2026-07-19T10:00:00",
+                        },
+                    ]
+                }
+            ),
+            body_shape="json_object",
+            content_type="application/json",
+        )
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 2)
+        self.assertEqual(
+            analysis["data_key_hits"],
+            ["date", "list", "title"],
+        )
 
 
 class PostCandidateRegressionTests(unittest.IsolatedAsyncioTestCase):

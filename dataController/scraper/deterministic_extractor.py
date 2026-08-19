@@ -5,7 +5,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, Tag
 
@@ -13,6 +13,12 @@ from bs4 import BeautifulSoup, Tag
 TITLE_KEYS = (
     "title",
     "subject",
+    "joboffertitle",
+    "positiontitle",
+    "postingtitle",
+    "announcementtitle",
+    "recruitmenttitle",
+    "vacancytitle",
     "name",
     "headline",
     "제목",
@@ -30,6 +36,7 @@ AUTHOR_KEYS = (
     "작성자",
     "부서",
     "담당부서",
+    "companyname",
 )
 DATE_KEYS = (
     "publishedat",
@@ -51,6 +58,9 @@ URL_KEYS = (
     "상세url",
 )
 ID_KEYS = (
+    "realid",
+    "jobofferid",
+    "requisitionid",
     "externalid",
     "noticeid",
     "postid",
@@ -88,6 +98,20 @@ ENGLISH_MONTHS = {
     "dec": 12,
     "december": 12,
 }
+ONCLICK_CALL_RE = re.compile(
+    r"^\s*(?:return\s+)?(?P<function>[A-Za-z_$][\w.$]*)\s*"
+    r"\((?P<arguments>[^)]{0,512})\)"
+)
+ONCLICK_ARGUMENT_RE = re.compile(
+    r"^\s*(?:['\"](?P<quoted>[A-Za-z0-9_-]{1,128})['\"]|"
+    r"(?P<bare>\d{1,128}))\s*$"
+)
+ONCLICK_NAVIGATION_HINTS = (
+    "article", "board", "detail", "go", "job", "move", "notice", "open",
+    "post", "recruit", "show", "view",
+)
+PLACEHOLDER_FRAGMENTS = {"n", "none", "void"}
+HTML_EXTRACTOR_CONFIG_VERSION = 4
 
 
 @dataclass
@@ -127,6 +151,25 @@ def _matching_key(record: Dict[str, Any], aliases: Iterable[str]) -> Optional[st
         match = normalized.get(_normalize_key(alias))
         if match is not None:
             return match
+
+    role_suffixes: Tuple[str, ...] = ()
+    if aliases is TITLE_KEYS:
+        role_suffixes = ("title", "subject", "headline")
+    elif aliases is DATE_KEYS:
+        role_suffixes = (
+            "date", "datetime", "timestamp", "publishedat", "createdat",
+            "updatedat", "postedat", "deadline",
+        )
+    elif aliases is URL_KEYS:
+        role_suffixes = ("url", "href", "link")
+    elif aliases is ID_KEYS:
+        role_suffixes = ("id", "seq", "no")
+
+    if role_suffixes:
+        for key in record:
+            normalized_key = _normalize_key(key)
+            if normalized_key.endswith(role_suffixes):
+                return str(key)
     return None
 
 
@@ -217,6 +260,140 @@ def _safe_detail_url(base_url: str, candidate: Any) -> Optional[str]:
     ):
         return None
     return absolute
+
+
+def _onclick_navigation_values(element: Tag) -> List[str]:
+    onclick = _normalize_text(element.get("onclick"))
+    match = ONCLICK_CALL_RE.match(onclick)
+    if not match:
+        return []
+
+    function_name = match.group("function").casefold()
+    if not any(hint in function_name for hint in ONCLICK_NAVIGATION_HINTS):
+        return []
+
+    values: List[str] = []
+    for raw_argument in match.group("arguments").split(","):
+        argument_match = ONCLICK_ARGUMENT_RE.match(raw_argument)
+        if not argument_match:
+            return []
+        values.append(
+            argument_match.group("quoted")
+            or argument_match.group("bare")
+        )
+    return values
+
+
+def _record_external_id(record: Tag, anchor: Tag) -> Optional[str]:
+    for element in (anchor, record):
+        for attribute in ("data-value", "data-id", "data-seq"):
+            value = _normalize_text(element.get(attribute))
+            compact = value.replace(",", "")
+            if compact and re.match(r"^[A-Za-z0-9_-]+$", compact):
+                return compact
+        navigation_values = _onclick_navigation_values(element)
+        if navigation_values:
+            return navigation_values[-1]
+    return None
+
+
+def _html_detail_url(
+    base_url: str,
+    anchor: Tag,
+    external_id: Optional[str],
+) -> Optional[str]:
+    href = _normalize_text(anchor.get("href"))
+    parsed_href = urlsplit(href)
+    is_placeholder = (
+        not href
+        or href in {"#", "/#"}
+        or href.casefold().startswith("javascript:")
+        or (
+            (
+                parsed_href.fragment.casefold() in PLACEHOLDER_FRAGMENTS
+                or (external_id and bool(parsed_href.fragment))
+            )
+            and parsed_href.path in {"", "/"}
+            and not parsed_href.scheme
+            and not parsed_href.netloc
+            and not parsed_href.query
+        )
+    )
+
+    base = urlsplit(base_url)
+    hostname = (base.hostname or "").casefold()
+    if (
+        is_placeholder
+        and external_id
+        and hostname.endswith("samsungcareers.com")
+        and base.path.rstrip("/").casefold() == "/hr"
+    ):
+        return urlunsplit(
+            (
+                base.scheme,
+                base.netloc,
+                "/hr/",
+                urlencode({"no": external_id}),
+                "",
+            )
+        )
+    if (
+        is_placeholder
+        and external_id
+        and hostname == "recruit.navercorp.com"
+        and base.path.rstrip("/").casefold() == "/rcrt/list.do"
+    ):
+        language = (parse_qs(base.query).get("lang") or ["ko"])[0]
+        return urlunsplit(
+            (
+                base.scheme,
+                base.netloc,
+                "/rcrt/view.do",
+                urlencode(
+                    {
+                        "annoId": external_id,
+                        "lang": language,
+                    }
+                ),
+                "",
+            )
+        )
+    if (
+        is_placeholder
+        and external_id
+        and hostname == "engineering.uos.ac.kr"
+        and re.search(
+            r"/korNotice/(?:allList|list)\.do$",
+            base.path,
+            re.IGNORECASE,
+        )
+    ):
+        source_params = parse_qs(base.query, keep_blank_values=True)
+        navigation_values = _onclick_navigation_values(anchor)
+        detail_params = {
+            "list_id": (source_params.get("list_id") or [""])[0],
+            "seq": external_id,
+        }
+        if len(navigation_values) >= 2:
+            detail_params["sort"] = navigation_values[-2]
+        for key in ("cate_id2", "cate_id", "identified"):
+            if key in source_params:
+                detail_params[key] = source_params[key][0]
+        return urlunsplit(
+            (
+                base.scheme,
+                base.netloc,
+                re.sub(
+                    r"(?:allList|list)\.do$",
+                    "view.do",
+                    base.path,
+                    flags=re.IGNORECASE,
+                ),
+                urlencode(detail_params),
+                "",
+            )
+        )
+    return None if is_placeholder else _safe_detail_url(base_url, href)
 
 
 def _normalize_date(value: Any) -> Optional[str]:
@@ -385,16 +562,36 @@ def _extract_json(
         title = _normalize_text(record.get(fields.get("title")))
         if not title:
             continue
+        external_id = _normalize_text(
+            record.get(fields.get("external_id"))
+        ) or None
+        detail_url = _safe_detail_url(
+            base_url,
+            record.get(fields.get("detail_url")),
+        )
+        parsed_base = urlsplit(base_url)
+        if (
+            not detail_url
+            and external_id
+            and (parsed_base.hostname or "").casefold()
+            == "careers.kakao.com"
+            and parsed_base.path.rstrip("/").casefold() == "/jobs"
+        ):
+            detail_url = urlunsplit(
+                (
+                    parsed_base.scheme,
+                    parsed_base.netloc,
+                    f"/jobs/{external_id}",
+                    parsed_base.query,
+                    "",
+                )
+            )
+
         notice = {
             "title": title,
             "author": _normalize_text(record.get(fields.get("author"))),
-            "detail_url": _safe_detail_url(
-                base_url,
-                record.get(fields.get("detail_url")),
-            ),
-            "external_id": _normalize_text(
-                record.get(fields.get("external_id"))
-            ) or None,
+            "detail_url": detail_url,
+            "external_id": external_id,
             "published_at": _normalize_date(
                 record.get(fields.get("published_at"))
             ),
@@ -435,6 +632,19 @@ def _meaningful_anchor(container: Tag) -> Optional[Tag]:
         parent = heading.find_parent("a", href=True)
         if parent:
             return parent
+
+    # 제목과 기간/메타데이터가 각각 링크인 카드에서는 가장 긴 링크가
+    # 제목이라는 보장이 없다. 제목 역할을 명시하는 구조를 먼저 사용한다.
+    for selector in (
+        "dt a[href]",
+        "[class*='title'] a[href]",
+        "a[class*='title'][href]",
+        "p a[href]",
+    ):
+        candidate = container.select_one(selector)
+        if candidate and _normalize_text(candidate.get_text(" ", strip=True)):
+            return candidate
+
     anchors = [
         anchor
         for anchor in container.find_all("a", href=True)
@@ -447,7 +657,91 @@ def _meaningful_anchor(container: Tag) -> Optional[Tag]:
     )
 
 
-def _html_record_candidates(soup: BeautifulSoup) -> Tuple[str, List[Tag]]:
+def _css_token(tag: Tag) -> str:
+    tag_id = _normalize_text(tag.get("id"))
+    if tag_id and re.match(r"^[A-Za-z_][\w-]*$", tag_id):
+        return f"#{tag_id}"
+
+    classes = [
+        str(value)
+        for value in (tag.get("class") or [])
+        if re.match(r"^[A-Za-z_][\w-]*$", str(value))
+    ]
+    if classes:
+        return f"{tag.name}." + ".".join(classes[:2])
+    return str(tag.name)
+
+
+def _record_group_css(parent: Tag, child_tag: str) -> str:
+    """Build a reusable selector anchored at the nearest semantic ancestor."""
+    path = [_css_token(parent)]
+    ancestor = parent.parent
+    while isinstance(ancestor, Tag) and ancestor.name != "[document]":
+        token = _css_token(ancestor)
+        path.insert(0, token)
+        if token.startswith("#") or "." in token:
+            break
+        ancestor = ancestor.parent
+    return " > ".join([*path, child_tag])
+
+
+def _group_context(parent: Tag) -> str:
+    values = []
+    current: Optional[Tag] = parent
+    for _ in range(4):
+        if not isinstance(current, Tag):
+            break
+        values.extend(
+            [
+                _normalize_text(current.get("id")),
+                *[
+                    _normalize_text(value)
+                    for value in (current.get("class") or [])
+                ],
+            ]
+        )
+        current = current.parent if isinstance(current.parent, Tag) else None
+    return " ".join(value for value in values if value).casefold()
+
+
+def _record_group_score(
+    parent: Tag,
+    records: List[Tag],
+    *,
+    base_url: str,
+) -> int:
+    """Prefer one coherent list whose links belong to the requested board."""
+    base = urlsplit(base_url)
+    base_path = base.path.rstrip("/").casefold()
+    score = min(len(records), 30) * 2
+
+    for record in records[:30]:
+        anchor = _meaningful_anchor(record)
+        if not anchor:
+            continue
+        detail = urlsplit(urljoin(base_url, str(anchor.get("href") or "")))
+        detail_path = detail.path.rstrip("/").casefold()
+        if detail.hostname == base.hostname:
+            score += 2
+        if base_path and (
+            detail_path == base_path
+            or detail_path.startswith(f"{base_path}/")
+        ):
+            score += 20
+
+    context = _group_context(parent)
+    if re.search(r"\b(notice|news|board|공지|게시)\b", context):
+        score += 20
+    if re.search(r"\b(event|banner|side|nav|menu|이벤트)\b", context):
+        score -= 20
+    return score
+
+
+def _html_record_candidates(
+    soup: BeautifulSoup,
+    *,
+    base_url: str,
+) -> Tuple[str, List[Tag]]:
     table_rows = []
     for row in soup.select("table tr"):
         anchor = _meaningful_anchor(row)
@@ -456,7 +750,7 @@ def _html_record_candidates(soup: BeautifulSoup) -> Tuple[str, List[Tag]]:
     if len(table_rows) >= 2:
         return "table tr", table_rows
 
-    for selector in ("article", "li"):
+    for selector in ("article",):
         containers = []
         global_has_date = bool(
             soup.find("time", attrs={"datetime": True})
@@ -473,6 +767,48 @@ def _html_record_candidates(soup: BeautifulSoup) -> Tuple[str, List[Tag]]:
                 containers.append(item)
         if len(containers) >= 2:
             return selector, containers
+
+    list_groups = []
+    for child_tag in ("li", "ul", "ol", "dl", "div"):
+        sibling_groups: Dict[int, Tuple[Tag, List[Tag]]] = {}
+        for item in soup.find_all(child_tag):
+            parent = item.parent
+            if not isinstance(parent, Tag):
+                continue
+            group = sibling_groups.setdefault(id(parent), (parent, []))
+            group[1].append(item)
+
+        for parent, sibling_items in sibling_groups.values():
+            records = []
+            for item in sibling_items:
+                if not _meaningful_anchor(item):
+                    continue
+                if not (
+                    item.find("time", attrs={"datetime": True})
+                    or DATE_RE.search(item.get_text(" ", strip=True))
+                ):
+                    continue
+                records.append(item)
+            if len(records) < 2:
+                continue
+            list_groups.append(
+                (
+                    _record_group_score(
+                        parent,
+                        records,
+                        base_url=base_url,
+                    ),
+                    _record_group_css(parent, child_tag),
+                    records,
+                )
+            )
+
+    if list_groups:
+        _, record_css, records = max(
+            list_groups,
+            key=lambda group: (group[0], len(group[2])),
+        )
+        return record_css, records
     return "", []
 
 
@@ -497,6 +833,7 @@ def _record_date_value(record: Tag) -> Any:
 def _record_author(record: Tag, cells: List[str], title: str) -> str:
     for selector in (
         "[rel='author']",
+        ".company",
         ".author",
         ".writer",
         ".department",
@@ -524,13 +861,22 @@ def _extract_html(
 ) -> ExtractionResult:
     soup = BeautifulSoup(html, "lxml")
     try:
-        if extractor_config and extractor_config.get("source_type") == "html":
+        if (
+            extractor_config
+            and extractor_config.get("source_type") == "html"
+            and int(extractor_config.get("version") or 0) >= 2
+        ):
+            extractor_config = dict(extractor_config)
+            extractor_config["version"] = HTML_EXTRACTOR_CONFIG_VERSION
             record_css = extractor_config.get("record_css") or ""
             records = soup.select(record_css) if record_css else []
         else:
-            record_css, records = _html_record_candidates(soup)
+            record_css, records = _html_record_candidates(
+                soup,
+                base_url=base_url,
+            )
             extractor_config = {
-                "version": 1,
+                "version": HTML_EXTRACTOR_CONFIG_VERSION,
                 "source_type": "html",
                 "record_css": record_css,
                 "fields": {
@@ -563,7 +909,8 @@ def _extract_html(
             if not title:
                 continue
             date_value = _record_date_value(record)
-            detail_url = _safe_detail_url(base_url, anchor.get("href"))
+            external_id = _record_external_id(record, anchor)
+            detail_url = _html_detail_url(base_url, anchor, external_id)
             cells = [
                 _normalize_text(cell.get_text(" ", strip=True))
                 for cell in record.find_all(["td", "th"])
@@ -573,7 +920,7 @@ def _extract_html(
                 "title": title,
                 "author": author,
                 "detail_url": detail_url,
-                "external_id": None,
+                "external_id": external_id,
                 "published_at": _normalize_date(date_value),
                 "url": base_url,
                 "created_at": now,

@@ -152,22 +152,3 @@ async def delete_my_account(user_id: int = Depends(get_current_user_id)):
     except Exception as e:
         print(f"❌ [서버 에러] delete_my_account 실패: {e}")
         raise HTTPException(status_code=500, detail=f"서버 에러: {str(e)}")
-
-# ---------------------------------------------------------
-# 🚀 신규 추가: 회원탈퇴 엔드포인트
-# ---------------------------------------------------------
-@router.delete("/me")
-async def delete_my_account(user_id: int = Depends(get_current_user_id)):
-    """현재 로그인된 사용자의 계정을 삭제(또는 비활성화)합니다."""
-    try:
-        success = delete_user_account(user_id)
-        if not success:
-            raise HTTPException(status_code=500, detail="회원탈퇴 처리에 실패했습니다.")
-
-        # 💡 팀의 API 응답 컨벤션(JSON 반환)을 유지하기 위해 200 OK 형태로 응답합니다.
-        return {
-            "status": "success",
-            "message": "회원탈퇴가 성공적으로 처리되었습니다."
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"서버 에러: {str(e)}")

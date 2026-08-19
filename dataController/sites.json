@@ -1,0 +1,24 @@
+{
+  "POST" : {
+    "삼성채용공고" : "https://www.samsungcareers.com/hr/",
+    "현대자동차 채용": "https://talent.hyundai.com/theme/hall.hc"
+  },
+  "GET" : {
+    "대전청년포털" : "https://www.daejeonyouthportal.kr/biz/businessIntro.do?dpmSectionFst=100&dpmSectionScd=4&commonMenuNo=304_305_323_332",
+    "경북대 컴퓨터학부": "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1&sca=%EC%9D%BC%EB%B0%98%EA%B3%B5%EC%A7%80",
+    "시립대 컴퓨터과학부": "https://engineering.uos.ac.kr/engineering/korNotice/allList.do?list_id=20013DA1&cate_id2=000010383&identified=anonymous&",
+    "충남대 컴퓨터융합학부": "https://computer.cnu.ac.kr/computer/notice/bachelor.do",
+    "충남대 인재개발원 현장실습 공지사항": "https://job.cnu.ac.kr/job/placement/placement01.do",
+    "충남대 소프트웨어중심사업단": "https://swuniv.cnu.ac.kr/swuniv/community/notice.do",
+    "한국장학재단 장학금 관련": "https://www.kosaf.go.kr/ko/notice.do?searchType=s&searchStr=%EC%9E%A5%ED%95%99%EA%B8%88&ctgrId1=&ctgrId2=",
+
+
+    "네이버 커리어 (SPA)": "https://recruit.navercorp.com/rcrt/list.do",
+    "카카오 채용 (GraphQL)": "https://careers.kakao.com/jobs?skillSet=&page=1&company=KAKAO&part=TECHNOLOGY&employeeType=&keyword=",
+    "한국연구재단 공지 (NRF)": "https://www.nrf.re.kr/biz/notice/list?menu_no=44",
+    "정보통신기획평가원 (IITP)": "https://www.iitp.kr/kr/1/notice/announce/announceList.it",
+    "IITP 입찰공고": "https://www.iitp.kr/web/lay1/bbs/S1T12C38/A/8/list.do?cpage=1&sort=latest&rows=10",
+    "데브이벤트 (GitHub 기반)": "https://dev-event.vercel.app/",
+    "온오프믹스 (행사)": "https://www.onoffmix.com/event/main"
+  }
+}

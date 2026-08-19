@@ -24,6 +24,7 @@ from dataController.scraper.processing_state import (
 )
 from dataController.scraper.deterministic_extractor import (
     ExtractionResult,
+    HTML_EXTRACTOR_CONFIG_VERSION,
     extract_notices_deterministically,
 )
 from dataController.selector.detect_api_auto import find_api, save_api
@@ -45,6 +46,52 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+MIN_RECORDS_FOR_COVERAGE_GATE = 4
+MIN_EXTRACTION_COVERAGE_RATIO = 0.5
+
+
+def _refresh_html_extractor_decision(
+    decision: str,
+    api: Dict[str, Any],
+) -> str:
+    config = api.get("extractor_config") or {}
+    if (
+        decision == "unchanged"
+        and config.get("source_type") == "html"
+        and int(config.get("version") or 0) < HTML_EXTRACTOR_CONFIG_VERSION
+    ):
+        logger.info(
+            "🔄 HTML 추출기 규칙 업그레이드 감지 (v%s -> v%s). "
+            "동일 원문을 한 번 재처리합니다.",
+            config.get("version") or 0,
+            HTML_EXTRACTOR_CONFIG_VERSION,
+        )
+        return "process"
+    return decision
+
+
+def _extraction_coverage_error(
+    api: Dict[str, Any],
+    result: ExtractionResult,
+) -> str | None:
+    if result.status != "success":
+        return None
+
+    validation_analysis = api.get("validation_analysis") or {}
+    expected_count = int(
+        validation_analysis.get("semantic_record_count") or 0
+    )
+    actual_count = len(result.notices)
+    if (
+        expected_count >= MIN_RECORDS_FOR_COVERAGE_GATE
+        and actual_count / expected_count < MIN_EXTRACTION_COVERAGE_RATIO
+    ):
+        return (
+            "의미 검증과 최종 추출 건수가 크게 다릅니다. "
+            f"semantic_records={expected_count}, "
+            f"extracted_records={actual_count}"
+        )
+    return None
 
 
 def _persist_api_after_extraction(api: Dict[str, Any], target_url: str) -> bool:
@@ -124,6 +171,16 @@ def _apply_deterministic_result(
     api_url: str,
     result: ExtractionResult,
 ) -> Dict[str, Any]:
+    coverage_error = _extraction_coverage_error(api, result)
+    if coverage_error:
+        logger.warning("⚠️ 추출 커버리지 gate 실패: %s", coverage_error)
+        return {
+            "status": "error",
+            "site_id": api.get("site_id"),
+            "notices": [],
+            "error_msg": coverage_error,
+        }
+
     if result.extractor_config:
         api["extractor_config"] = result.extractor_config
         api["schema_hash"] = result.schema_hash
@@ -198,6 +255,13 @@ async def run_full_scrape(url: str) -> Dict[str, Any]:
         selection_mode=api.get("selection_mode") or "cached",
         processing_mode="extractor_pipeline",
         candidate_count=api.get("_candidate_count"),
+        selection_decision=(
+            api.get("selection_decision")
+            or ("cached_reuse" if not api.get("_pending_persistence") else None)
+        ),
+        selection_reason=api.get("selection_reason"),
+        selected_candidate_index=api.get("api_index"),
+        candidate_evidence=api.get("_candidate_evidence"),
         llm_used=bool(api.get("_llm_used")),
         llm_input_tokens=(api.get("_llm_usage") or {}).get("input_tokens"),
         llm_output_tokens=(api.get("_llm_usage") or {}).get("output_tokens"),
@@ -427,6 +491,10 @@ async def run_full_scrape(url: str) -> Dict[str, Any]:
     primary_text = build_parser_text(response.text, "lxml")
     new_hash = get_text_hash(primary_text)
     observation_decision = decide_observation(new_hash, processing_state)
+    observation_decision = _refresh_html_extractor_decision(
+        observation_decision,
+        api,
+    )
     if observation_decision != "process":
         logger.info(
             "✅ 원문 처리 생략 (decision=%s). DB 기존 데이터 반환.",

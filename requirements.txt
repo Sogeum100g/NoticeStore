@@ -18,7 +18,8 @@ Requests==2.32.5          # 간단한 HTTP 요청 및 리다이렉션 추적용
 httpx==0.28.1             # 비동기(Async) HTTP 클라이언트 요청 처리
 
 # [인공지능 및 데이터 정제]
-openai==2.49.0            # GPT-5 nano를 사용하여 애매한 API 후보를 선별
+openai==2.49.0            # OpenAI GPT-4.1 mini 후보 선별
+google-genai==2.18.1      # Gemini 후보 선별(Interactions API)
 protobuf==6.33.5          # Firebase 등 구글 서비스 데이터 직렬화
 
 # [데이터베이스 및 보안]

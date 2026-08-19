@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional, List
+from pydantic import BaseModel, Field
+from typing import Literal, Optional, List
 
 # --- [인증 관련] ---
 class LoginRequest(BaseModel):
@@ -60,8 +60,17 @@ class InquiryRequest(BaseModel):
     category: str
     title: str
     content: str
+    site_id: Optional[int] = Field(default=None, ge=1)
 
 class ReplyRequest(BaseModel):
     reply_content: str
 
 
+class CrawlRunReviewRequest(BaseModel):
+    label: Literal[
+        "correct",
+        "incorrect",
+        "no_valid_candidate",
+        "needs_more_observation",
+    ]
+    review_notes: Optional[str] = Field(default=None, max_length=2000)

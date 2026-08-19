@@ -457,6 +457,10 @@ def create_crawl_run(
     selection_mode: Optional[str] = None,
     processing_mode: Optional[str] = None,
     candidate_count: Optional[int] = None,
+    selection_decision: Optional[str] = None,
+    selection_reason: Optional[str] = None,
+    selected_candidate_index: Optional[int] = None,
+    candidate_evidence: Optional[List[Dict[str, Any]]] = None,
     llm_used: bool = False,
     llm_input_tokens: Optional[int] = None,
     llm_output_tokens: Optional[int] = None,
@@ -471,10 +475,14 @@ def create_crawl_run(
                 """
                 INSERT INTO crawl_runs (
                     site_id, api_id, status, selection_mode, processing_mode,
-                    candidate_count, llm_used, llm_input_tokens,
-                    llm_output_tokens, llm_cost
+                    candidate_count, selection_decision, selection_reason,
+                    selected_candidate_index, candidate_evidence, llm_used,
+                    llm_input_tokens, llm_output_tokens, llm_cost
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                )
                 RETURNING crawl_run_id;
                 """,
                 (
@@ -484,6 +492,10 @@ def create_crawl_run(
                     selection_mode,
                     processing_mode,
                     candidate_count,
+                    selection_decision,
+                    selection_reason,
+                    selected_candidate_index,
+                    Jsonb(candidate_evidence or []),
                     llm_used,
                     llm_input_tokens,
                     llm_output_tokens,
@@ -561,6 +573,94 @@ def finish_crawl_run(
         conn.rollback()
     finally:
         conn.close()
+
+
+def get_crawl_runs_for_review(
+    *,
+    reviewed: bool = False,
+    status: Optional[str] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Return bounded, sanitized crawl telemetry for an admin review queue."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        conditions = [
+            "cr.review_label IS NOT NULL"
+            if reviewed
+            else "cr.review_label IS NULL"
+        ]
+        params: List[Any] = []
+        if status:
+            conditions.append("cr.status = %s")
+            params.append(status)
+        params.append(limit)
+
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                f"""
+                SELECT cr.crawl_run_id, cr.site_id, s.site_url,
+                       cr.status, cr.selection_mode,
+                       cr.selection_decision, cr.selection_reason,
+                       cr.selected_candidate_index,
+                       cr.candidate_count, cr.candidate_evidence,
+                       cr.extracted_notice_count, cr.llm_used,
+                       cr.llm_input_tokens, cr.llm_output_tokens,
+                       cr.llm_cost, cr.error_code, cr.error_message,
+                       cr.started_at, cr.finished_at,
+                       cr.review_label, cr.review_notes,
+                       cr.reviewed_by, cr.reviewed_at
+                FROM crawl_runs cr
+                JOIN sites s ON s.site_id = cr.site_id
+                WHERE {" AND ".join(conditions)}
+                ORDER BY cr.started_at DESC
+                LIMIT %s;
+                """,
+                tuple(params),
+            )
+            return cur.fetchall()
+    except Exception as exc:
+        print(f"❌ 크롤링 검토 큐 조회 에러: {exc}")
+        return []
+    finally:
+        conn.close()
+
+
+def review_crawl_run(
+    crawl_run_id: int,
+    *,
+    reviewer_id: int,
+    label: str,
+    review_notes: Optional[str] = None,
+) -> bool:
+    """Persist a human selection label for later calibration."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE crawl_runs
+                SET review_label = %s,
+                    review_notes = %s,
+                    reviewed_by = %s,
+                    reviewed_at = NOW()
+                WHERE crawl_run_id = %s;
+                """,
+                (label, review_notes, reviewer_id, crawl_run_id),
+            )
+            updated = cur.rowcount > 0
+            conn.commit()
+            return updated
+    except Exception as exc:
+        print(f"❌ 크롤링 검토 결과 저장 에러: {exc}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
 
 def get_sites_with_new_status() -> List[tuple]:
     """시스템에 등록된 모든 사이트 정보와 새 공지 존재 여부를 반환합니다."""

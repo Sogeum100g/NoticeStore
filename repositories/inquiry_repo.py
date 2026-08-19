@@ -7,7 +7,15 @@ from repositories.db_manager import get_db_connection
 
 # --- [1:1 고객 문의(Inquiry) 관리] ---
 
-def insert_inquiry(user_id: int, category: str, title: str, content: str) -> bool:
+def insert_inquiry(
+    user_id: int,
+    category: str,
+    title: str,
+    content: str,
+    *,
+    site_id: Optional[int] = None,
+    crawl_run_id: Optional[int] = None,
+) -> bool:
     """사용자의 1:1 문의 내용을 DB에 저장합니다."""
     conn = get_db_connection()
     if not conn: return False
@@ -15,10 +23,22 @@ def insert_inquiry(user_id: int, category: str, title: str, content: str) -> boo
     try:
         with conn.cursor() as cur:
             query = """
-                INSERT INTO inquiries (user_id, category, title, content)
-                VALUES (%s, %s, %s, %s);
+                INSERT INTO inquiries (
+                    user_id, category, title, content, site_id, crawl_run_id
+                )
+                VALUES (%s, %s, %s, %s, %s, %s);
             """
-            cur.execute(query, (user_id, category, title, content))
+            cur.execute(
+                query,
+                (
+                    user_id,
+                    category,
+                    title,
+                    content,
+                    site_id,
+                    crawl_run_id,
+                ),
+            )
             conn.commit()  # 데이터 변경이 일어나는 INSERT 문이므로 반드시 commit 호출
             return True
 
@@ -41,6 +61,45 @@ def get_inquiry_by_id(inquiry_id: int) -> Optional[Dict[str, Any]]:
             return cur.fetchone()
     except Exception as e:
         print(f"❌ 문의글 상세 조회 에러: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def get_user_inquiry_site_context(
+    user_id: int,
+    site_id: int,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a subscribed site and its latest crawl run without raw payloads."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT s.site_id, s.site_url,
+                       COALESCE(s.crawl_status, 'active') AS crawl_status,
+                       s.validation_status, s.validation_error,
+                       latest.crawl_run_id,
+                       latest.status AS crawl_run_status,
+                       latest.error_code
+                FROM sites s
+                JOIN user_subscriptions us ON us.site_id = s.site_id
+                LEFT JOIN LATERAL (
+                    SELECT cr.crawl_run_id, cr.status, cr.error_code
+                    FROM crawl_runs cr
+                    WHERE cr.site_id = s.site_id
+                    ORDER BY cr.started_at DESC
+                    LIMIT 1
+                ) latest ON TRUE
+                WHERE us.user_id = %s AND s.site_id = %s;
+                """,
+                (user_id, site_id),
+            )
+            return cur.fetchone()
+    except Exception as exc:
+        print(f"❌ 문의 사이트 진단 조회 에러: {exc}")
         return None
     finally:
         conn.close()
@@ -84,7 +143,8 @@ def get_user_inquiries(user_id: int) -> List[Dict[str, Any]]:
             query = """
                 SELECT 
                     inquiry_id, category, title, content, 
-                    status, created_at, reply_content, replied_at 
+                    status, created_at, reply_content, replied_at,
+                    site_id, crawl_run_id
                 FROM inquiries 
                 WHERE user_id = %s 
                 ORDER BY created_at DESC;

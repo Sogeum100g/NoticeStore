@@ -7,6 +7,7 @@ from celery import Celery
 from celery.schedules import crontab
 from celery.utils.log import get_task_logger  # ✅ 필수 임포트 추가
 from dotenv import load_dotenv
+from kombu import Exchange, Queue
 
 # 기존 임포트 유지
 from repositories.notice_repo import get_global_crawl_targets
@@ -21,9 +22,50 @@ load_dotenv()
 REDIS_URL = os.getenv("REDIS_URL", "redis://noticestore_redis:6379/0")
 celery_app = Celery("notice_store_worker", broker=REDIS_URL, backend=REDIS_URL)
 
+CRAWL_QUEUE = "crawl"
+NOTIFICATION_QUEUE = "notification"
+CRAWL_EXCHANGE = Exchange(CRAWL_QUEUE, type="direct")
+NOTIFICATION_EXCHANGE = Exchange(NOTIFICATION_QUEUE, type="direct")
+
 # 시간대 설정 (KST 강제 지정)
-celery_app.conf.timezone = 'Asia/Seoul'
-celery_app.conf.enable_utc = False
+celery_app.conf.update(
+    timezone="Asia/Seoul",
+    enable_utc=False,
+    task_default_queue=NOTIFICATION_QUEUE,
+    task_default_exchange=NOTIFICATION_QUEUE,
+    task_default_exchange_type="direct",
+    task_default_routing_key=NOTIFICATION_QUEUE,
+    task_queues=(
+        Queue(
+            CRAWL_QUEUE,
+            exchange=CRAWL_EXCHANGE,
+            routing_key=CRAWL_QUEUE,
+        ),
+        Queue(
+            NOTIFICATION_QUEUE,
+            exchange=NOTIFICATION_EXCHANGE,
+            routing_key=NOTIFICATION_QUEUE,
+        ),
+    ),
+    task_routes={
+        "celery_app.dispatch_all_sites": {
+            "queue": CRAWL_QUEUE,
+            "routing_key": CRAWL_QUEUE,
+        },
+        "celery_app.scrape_target_site": {
+            "queue": CRAWL_QUEUE,
+            "routing_key": CRAWL_QUEUE,
+        },
+        "celery_app.check_notifications": {
+            "queue": NOTIFICATION_QUEUE,
+            "routing_key": NOTIFICATION_QUEUE,
+        },
+        "celery_app.send_fcm_task": {
+            "queue": NOTIFICATION_QUEUE,
+            "routing_key": NOTIFICATION_QUEUE,
+        },
+    },
+)
 
 # 💡 Celery 전용 로거 인스턴스 생성
 logger = get_task_logger(__name__)
@@ -34,11 +76,19 @@ celery_app.conf.beat_schedule = {
     'scrape-subscribed-sites-3-times-a-day': {
         'task': 'celery_app.dispatch_all_sites',
         'schedule': crontab(hour='9, 13, 17', minute='14'),
+        'options': {
+            'queue': CRAWL_QUEUE,
+            'routing_key': CRAWL_QUEUE,
+        },
     },
     # 2. 신규: 1분마다 알림 발송 대상자 확인 (단일 등록)
     'check-and-send-notifications-every-minute': {
         'task': 'celery_app.check_notifications',
         'schedule': crontab(minute='*'), # 매 분마다 실행
+        'options': {
+            'queue': NOTIFICATION_QUEUE,
+            'routing_key': NOTIFICATION_QUEUE,
+        },
     },
 }
 
@@ -48,7 +98,7 @@ def check_notifications():
     """매 분마다 실행되어 조건에 맞는 사용자에게 알림을 발송합니다."""
     kst = ZoneInfo('Asia/Seoul')
     now_str = datetime.now(kst).strftime("%H:%M") 
-    logger.info(f"⏰ {now_str} (KST) - 알림 대상자 확인 중...") # 💡 print -> logger.info
+    # logger.info(f"⏰ {now_str} (KST) - 알림 대상자 확인 중...") # 💡 print -> logger.info
 
     # 주의: FastAPI에서 DB 접근 함수가 비동기(async def)로 작성되어 있다면 
     # 아래와 같이 asyncio.run()으로 감싸서 호출해야 합니다.
@@ -60,13 +110,13 @@ def check_notifications():
         # 동기 함수라면:
         users = get_users_to_notify(now_str)
     except Exception as e:
-        logger.error(f"❌ 대상자 조회 실패: {e}", exc_info=True) # 💡 스택 트레이스 포함
+        # logger.error(f"❌ 대상자 조회 실패: {e}", exc_info=True) # 💡 스택 트레이스 포함
         return
     
     if not users:
         return
 
-    logger.info(f"👤 [Celery 스케줄러] 조회된 발송 대상자 수: {len(users)}명. 개별 큐 발송 시작...")
+    # logger.info(f"👤 [Celery 스케줄러] 조회된 발송 대상자 수: {len(users)}명. 개별 큐 발송 시작...")
 
     for user in users:
         user_id = user['user_id']
@@ -90,7 +140,7 @@ def send_fcm_task(self, fcm_token: str, summary_msg: str):
             body=summary_msg,
             data={"screen": "subscriptions"}
         )
-        logger.info(f"✅ FCM 전송 성공: {fcm_token[:10]}...")
+        # logger.info(f"✅ FCM 전송 성공: {fcm_token[:10]}...")
     except Exception as exc:
         logger.error(f"❌ FCM 전송 실패, 재시도 중... 에러: {exc}")
         # 실패 시 10초 후 재시도
