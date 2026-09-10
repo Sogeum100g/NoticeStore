@@ -3,13 +3,27 @@ import re
 from html.parser import HTMLParser
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from bs4 import BeautifulSoup
+
+from dataController.scraper.views.embedded_data import (
+    extract_embedded_json_data,
+    extract_javascript_hydration_data,
+    extract_next_data,
+)
+from dataController.youtube_community import (
+    extract_yt_initial_data,
+    iter_youtube_community_posts,
+)
+
 
 TITLE_KEY_ALIASES = {
     "title", "subject", "article_title", "post_title", "job_title", "zz_title", "name",
+    "rt_nm",
 }
 DATE_KEY_ALIASES = {
     "date", "regdate", "reg_date", "posted", "posted_at", "created", "created_at",
     "published", "published_at", "deadline", "enddate", "end_date", "zz_end_dt", "zz_str_dt",
+    "rt_acpt_strt_dttm", "rt_acpt_end_dttm",
 }
 COUNT_KEY_ALIASES = {
     "count", "total", "total_count", "active_cnt", "record_count",
@@ -31,6 +45,7 @@ ENGLISH_MONTH_RE = (
 ENGLISH_DAY_RE = r"(?:0?[1-9]|[12]\d|3[01])"
 DATE_TEXT_RE = re.compile(
     r"(?:20\d{2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{1,2})"
+    r"|(?:(?<!\d)\d{2}[.\-/]\s?\d{1,2}[.\-/]\s?\d{1,2}(?!\d))"
     r"|(?:\d{1,2}[./]\s?\d{1,2}\s?\([^)]+\))"
     r"|(?:\d+\s*(?:분|시간|일|주|개월|년)\s*전)"
     r"|(?:방금\s*전|오늘|어제)"
@@ -39,6 +54,10 @@ DATE_TEXT_RE = re.compile(
     rf"(?!\d)(?:,?\s*\d{{4}})?)"
     rf"|(?:{ENGLISH_DAY_RE}(?:st|nd|rd|th)?\s+{ENGLISH_MONTH_RE}\.?"
     rf"(?:\s+\d{{4}})?)",
+    re.IGNORECASE,
+)
+DEADLINE_TEXT_RE = re.compile(
+    r"(?:\bD\s*-\s*\d+\b|상시\s*채용|채용\s*시\s*마감|오늘\s*마감)",
     re.IGNORECASE,
 )
 MACHINE_DATE_RE = re.compile(r"^20\d{2}-\d{2}-\d{2}(?:[T\s].*)?$")
@@ -51,7 +70,7 @@ GENERIC_LINK_TEXTS = {
     "공지사항", "업데이트", "이벤트", "전체", "공지", "점검", "이전", "다음",
     "read more", "learn more", "view more", "자세히 보기", "더보기",
 }
-RECORD_CONTAINER_TAGS = {"li", "article", "tr", "ul", "ol", "dl"}
+RECORD_CONTAINER_TAGS = {"li", "a", "article", "tr", "ul", "ol", "dl"}
 RECORD_CLASS_HINTS = {
     "article", "board", "card", "entry", "item", "list", "news", "notice",
     "post", "release", "result", "row",
@@ -213,7 +232,7 @@ class _VisibleHTMLAnalyzer(HTMLParser):
         }
         return bool(class_tokens & RECORD_CLASS_HINTS)
 
-    def _finalize_record(self, record: Dict[str, Any]) -> None:
+    def _finalize_record(self, record: Dict[str, Any]) -> bool:
         text = " ".join(record["visible_parts"])
         heading_titles = [
             title
@@ -227,22 +246,25 @@ class _VisibleHTMLAnalyzer(HTMLParser):
         date_count = max(
             len(DATE_TEXT_RE.findall(text)),
             len(record["machine_dates"]),
+            len(DEADLINE_TEXT_RE.findall(text)),
         )
-        if not titles:
-            return
+        if not titles or record.get("nested_candidate_count", 0) >= 2:
+            return False
         # 날짜 헤더 하나 아래에 여러 article을 묶는 타임라인형 목록도 있다.
         # article은 HTML 자체가 독립 콘텐츠 단위를 뜻하므로, 페이지에 날짜
         # 증거가 있을 때만 상위 날짜를 상속할 수 있도록 후보로 보존한다.
         if date_count < 1 and record["tag"] != "article":
-            return
+            return False
 
         self.record_candidates.append(
             {
                 "title": titles[0],
                 "date_count": date_count,
                 "container_tag": record["tag"],
+                "signature": record["signature"],
             }
         )
+        return True
 
     def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
         lowered = tag.lower()
@@ -255,10 +277,26 @@ class _VisibleHTMLAnalyzer(HTMLParser):
             self.record_stack.append(
                 {
                     "tag": lowered,
+                    "signature": (
+                        lowered,
+                        tuple(
+                            sorted(
+                                token
+                                for key, value in attrs
+                                if key.lower() == "class" and value
+                                for token in re.split(
+                                    r"[^a-z0-9_-]+",
+                                    value.lower(),
+                                )
+                                if token
+                            )
+                        ),
+                    ),
                     "visible_parts": [],
                     "anchor_texts": [],
                     "heading_texts": [],
                     "machine_dates": [],
+                    "nested_candidate_count": 0,
                 }
             )
         if lowered in {"h1", "h2", "h3", "h4", "h5", "h6"}:
@@ -278,6 +316,34 @@ class _VisibleHTMLAnalyzer(HTMLParser):
                 self.machine_dates.append(datetime_value)
                 for record in self.record_stack:
                     record["machine_dates"].append(datetime_value)
+        class_value = next(
+            (
+                value
+                for key, value in attrs
+                if key.lower() == "class" and value
+            ),
+            "",
+        )
+        date_attribute = next(
+            (
+                value
+                for key, value in attrs
+                if value
+                and (
+                    key.lower() in {"data-date", "data-datetime"}
+                    or (
+                        key.lower() == "title"
+                        and "date" in (class_value or "").lower()
+                    )
+                )
+                and MACHINE_DATE_RE.match(value)
+            ),
+            None,
+        )
+        if date_attribute:
+            self.machine_dates.append(date_attribute)
+            for record in self.record_stack:
+                record["machine_dates"].append(date_attribute)
         if lowered == "a":
             self.in_anchor = True
             self.anchor_parts = []
@@ -313,7 +379,9 @@ class _VisibleHTMLAnalyzer(HTMLParser):
             record = self.record_stack[index]
             if record["tag"] == lowered:
                 self.record_stack.pop(index)
-                self._finalize_record(record)
+                if self._finalize_record(record):
+                    for ancestor in self.record_stack:
+                        ancestor["nested_candidate_count"] += 1
                 break
 
     def handle_data(self, data: str) -> None:
@@ -375,6 +443,100 @@ def _semantic_sample(records: Iterable[Dict[str, Any]], fallback: str, limit: in
     return " ".join((fallback or "").split())[:limit]
 
 
+def _analyze_youtube_community_html(body_text: str) -> Optional[Dict[str, Any]]:
+    initial_data = extract_yt_initial_data(body_text)
+    if initial_data is None:
+        return None
+
+    posts = []
+    for post in iter_youtube_community_posts(initial_data):
+        content_runs = post.get("contentText", {}).get("runs", [])
+        title = "".join(
+            str(run.get("text") or "")
+            for run in content_runs
+            if isinstance(run, dict)
+        ).strip()
+        if not title:
+            continue
+        posts.append(
+            {
+                "title": title,
+                "date": post.get("publishedTimeText") or {},
+                "url": (
+                    f"https://www.youtube.com/post/{post.get('postId')}"
+                    if post.get("postId")
+                    else ""
+                ),
+            }
+        )
+
+    record_count = len(posts)
+    if record_count < 1:
+        return None
+    return {
+        "data_key_hits": ["date", "list", "title"],
+        "semantic_record_count": record_count,
+        "title_date_pair_count": sum(bool(post["date"]) for post in posts),
+        "has_repeated_records": record_count >= 2,
+        "has_notice_terms": True,
+        "semantic_sample": _semantic_sample(posts, body_text),
+        "analysis_kind": "youtube_yt_initial_data",
+    }
+
+
+def _analyze_embedded_data_html(body_text: str) -> Optional[Dict[str, Any]]:
+    """Fall back to conservative hydration JSON for CSR pages.
+
+    Some Next.js pages render only a loading shell server-side and fetch the
+    actual list client-side, but still embed the initial payload in
+    ``__NEXT_DATA__`` (e.g. dev-event.vercel.app). The visible-DOM analyzer
+    above finds no repeated records on these pages even though the data is
+    already present in the response, so retry against that embedded JSON
+    using the same structured-data walk used for JSON candidates.
+    """
+    try:
+        soup = BeautifulSoup(body_text or "", "lxml")
+    except Exception:
+        return None
+    try:
+        next_data = extract_next_data(soup)
+        application_json = (
+            extract_embedded_json_data(soup) if not next_data else None
+        )
+        javascript_json = (
+            extract_javascript_hydration_data(soup)
+            if not next_data and not application_json
+            else None
+        )
+        embedded_data = next_data or application_json or javascript_json
+    finally:
+        soup.decompose()
+    if not embedded_data:
+        return None
+
+    key_hits, record_count, title_date_pairs, records, string_values = _walk_structured_data(
+        embedded_data
+    )
+    if record_count < 2:
+        return None
+    combined_strings = " ".join(string_values).lower()
+    return {
+        "data_key_hits": sorted(key_hits),
+        "semantic_record_count": record_count,
+        "title_date_pair_count": title_date_pairs,
+        "has_repeated_records": True,
+        "has_notice_terms": any(term in combined_strings for term in NOTICE_TERMS),
+        "semantic_sample": _semantic_sample(records, body_text),
+        "analysis_kind": (
+            "next_data"
+            if next_data
+            else "embedded_json"
+            if application_json
+            else "javascript_hydration"
+        ),
+    }
+
+
 def analyze_candidate_body(
     body_text: str,
     *,
@@ -399,6 +561,10 @@ def analyze_candidate_body(
 
     is_html = body_shape == "html" or "html" in (content_type or "").lower()
     if is_html:
+        youtube_analysis = _analyze_youtube_community_html(body_text)
+        if youtube_analysis is not None:
+            return youtube_analysis
+
         parser = _VisibleHTMLAnalyzer()
         try:
             parser.feed(body_text or "")
@@ -412,16 +578,24 @@ def analyze_candidate_body(
             for text in (parser.heading_texts + parser.anchor_texts)
             if _is_meaningful_title(text)
         ]
-        dated_titles = list(
-            dict.fromkeys(
-                record["title"]
-                for record in parser.record_candidates
-                if record.get("title") and record.get("date_count", 0) >= 1
-            )
+        dated_records = [
+            record
+            for record in parser.record_candidates
+            if record.get("title") and record.get("date_count", 0) >= 1
+        ]
+        dated_groups: Dict[Tuple[str, Tuple[str, ...]], List[str]] = {}
+        for record in dated_records:
+            titles = dated_groups.setdefault(record["signature"], [])
+            titles.append(record["title"])
+        dated_titles = max(
+            dated_groups.values(),
+            key=len,
+            default=[],
         )
         date_count = max(
             len(DATE_TEXT_RE.findall(visible_text)),
             len(parser.machine_dates),
+            len(DEADLINE_TEXT_RE.findall(visible_text)),
         )
         grouped_article_titles = list(
             dict.fromkeys(
@@ -435,7 +609,7 @@ def analyze_candidate_body(
         # 요구하여 날짜 그룹형 타임라인을 목록으로 인정한다.
         if len(dated_titles) >= 2:
             localized_titles = dated_titles
-        elif date_count >= 1 and len(grouped_article_titles) >= 2:
+        elif parser.machine_dates and len(grouped_article_titles) >= 2:
             localized_titles = grouped_article_titles
         else:
             localized_titles = dated_titles
@@ -448,6 +622,19 @@ def analyze_candidate_body(
             key_hits.add("date")
         if repeated:
             key_hits.add("list")
+
+        # A Next.js page can render only the first visible page of a list
+        # while __NEXT_DATA__ embeds the full underlying dataset (e.g. a
+        # complete announcement archive vs. ~12 rendered cards). Prefer
+        # whichever source has the larger genuinely-repeated count so the
+        # reference used for later over-extraction checks reflects the
+        # real data volume, not just what got server-rendered.
+        next_data_analysis = _analyze_embedded_data_html(body_text)
+        if next_data_analysis is not None and (
+            not repeated
+            or next_data_analysis["semantic_record_count"] > record_count
+        ):
+            return next_data_analysis
 
         sample_text = " | ".join((localized_titles or meaningful_titles)[:4])
         return {

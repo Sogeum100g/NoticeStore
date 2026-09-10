@@ -25,7 +25,7 @@
     "collect", "telemetry", "beacon", "click_protection", "window_focus",
     "static", "assets", "fonts", "css", "jquery", "bootstrap",
     "sodar", "runner", "sync", "cookie", "match", "ping", "opera", "zemanta", "mediago",
-    "beusable", "amplitude", "gtag", "gtm"
+    "beusable", "amplitude", "gtag", "gtm", "_build/template", "clarity.ms"
   ],
   "STATIC_CODE_KEYWORDS": [
     "webpack", "framework-", "app-", "polyfills-", "runtime-", "vendor-",

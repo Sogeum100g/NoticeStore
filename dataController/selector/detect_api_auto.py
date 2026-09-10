@@ -17,6 +17,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from repositories import notice_repo
+from dataController.scraper.sites.dcinside import (
+    is_recommended_list, preserve_list_filter, validate_list_response,
+)
 from dataController.security.url_safety import (
     ResponseTooLargeError,
     UnsafeUrlError,
@@ -24,6 +27,7 @@ from dataController.security.url_safety import (
     sanitize_outbound_headers,
     validate_public_url,
 )
+from dataController.security.site_access import site_access_block_reason
 from dataController.selector.candidate_analyzer import analyze_candidate_body
 from dataController.selector.candidate_collector import collect_candidates
 from dataController.selector.candidate_ranker import build_candidate_pool, rank_candidates
@@ -46,8 +50,34 @@ TEXTUAL_CONTENT_TYPE_HINTS = (
     "text/x-javascript", "application/graphql-response+json", "javasciprt"
 )
 MAX_VALIDATION_CANDIDATES = 8
-MAX_VALIDATION_BODY_BYTES = 700_000
+MAX_EXTRACTION_CANDIDATE_ATTEMPTS = 3
 MAX_EVIDENCE_REASON_LENGTH = 500
+
+
+def _prepare_list_candidate(candidate: Dict[str, Any], target_url: str) -> bool:
+    """Keep the submitted list scope through browser redirects and cached APIs."""
+    source_url = candidate.get("api_url") or ""
+    corrected_url = preserve_list_filter(target_url, source_url)
+    if is_recommended_list(target_url):
+        candidate["_requested_list_url"] = target_url
+    if corrected_url == source_url:
+        return False
+    candidate["api_url"] = corrected_url
+    candidate["payload"] = dict(parse_qsl(urlsplit(corrected_url).query, keep_blank_values=True))
+    candidate["query_params"] = dict(candidate["payload"])
+    # Discovery described the unfiltered body. Replay must supply fresh evidence.
+    for key in ("_validated_response_snapshot", "validation_analysis", "features"):
+        candidate.pop(key, None)
+    candidate["_pending_persistence"] = True
+    return True
+
+
+def _nonnegative_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _redact_candidate_url(url: str) -> str:
@@ -121,6 +151,26 @@ def build_candidate_evidence(
                     candidate.get("score_reasons") or []
                 )[:20],
                 "features": dict(candidate.get("features") or {}),
+                "response_size": {
+                    "discovery_transfer_bytes": _nonnegative_int(
+                        candidate.get("transfer_bytes")
+                    ),
+                    "discovery_decoded_bytes": _nonnegative_int(
+                        candidate.get("decoded_bytes")
+                    ),
+                    "validation_transfer_bytes": _nonnegative_int(
+                        candidate.get("validation_transfer_bytes")
+                    ),
+                    "validation_decoded_bytes": _nonnegative_int(
+                        candidate.get("validation_decoded_bytes")
+                    ),
+                    "content_type": str(
+                        candidate.get("content_type") or ""
+                    )[:160],
+                    "content_encoding": str(
+                        candidate.get("content_encoding") or "identity"
+                    )[:80],
+                },
                 "validation_status": (
                     candidate.get("validation_status")
                     or "not_replayed"
@@ -141,6 +191,7 @@ def _record_selection_failure(
     selection_reason: str,
     candidates: Optional[List[Dict[str, Any]]] = None,
     error_code: str,
+    run_status: str = "failed",
 ) -> None:
     crawl_run_id = notice_repo.create_crawl_run(
         site_id,
@@ -154,7 +205,7 @@ def _record_selection_failure(
     )
     notice_repo.finish_crawl_run(
         crawl_run_id,
-        status="failed",
+        status=run_status,
         error_code=error_code,
         error_message=selection_reason,
     )
@@ -173,7 +224,10 @@ def save_site(url: str) -> Optional[int]:
 
 
 def save_api(api: Dict[str, Any], url: str) -> Optional[int]:
-    site_id = notice_repo.select_site_id(url)
+    # 비동기 등록에서 확정한 site_id가 있으면 URL 재조회보다 우선합니다.
+    # 단축 URL/리다이렉트 URL은 수집 시 최종 URL로 바뀔 수 있으므로 URL만으로
+    # 다시 찾으면 앱이 폴링 중인 사이트와 다른 사이트에 결과가 저장됩니다.
+    site_id = api.get("site_id") or notice_repo.select_site_id(url)
     api_id = notice_repo.upsert_api_for_site(
         site_id=site_id,
         method_type=api.get("method_type"),
@@ -262,14 +316,37 @@ def _sync_validate_candidate(candidate: Dict[str, Any]) -> Tuple[str, str]:
             api_url,
             headers=headers,
             timeout=12,
-            max_response_bytes=MAX_VALIDATION_BODY_BYTES,
             **request_kwargs,
         )
         try:
             content_type = response.headers.get("Content-Type", "").lower()
+            response_metrics = getattr(response, "__dict__", {}).get(
+                "_response_size_metrics"
+            )
+            if response_metrics is not None:
+                candidate["validation_transfer_bytes"] = (
+                    response_metrics.transfer_bytes
+                )
+                candidate["validation_decoded_bytes"] = (
+                    response_metrics.decoded_bytes
+                )
+                size_summary = (
+                    f", transfer_bytes={response_metrics.transfer_bytes}, "
+                    f"decoded_bytes={response_metrics.decoded_bytes}"
+                )
+            else:
+                size_summary = ""
             if not response.encoding:
                 response.encoding = response.apparent_encoding or "utf-8"
             text = response.text
+
+            access_block_reason = site_access_block_reason(
+                status_code=response.status_code,
+                url=getattr(response, "url", None) or api_url,
+                body_text=text,
+            )
+            if access_block_reason:
+                return "access_blocked", access_block_reason
 
             is_textual = any(hint in content_type for hint in TEXTUAL_CONTENT_TYPE_HINTS) or not content_type
             if response.status_code != 200 or not is_textual or len(text.strip()) < 80:
@@ -277,6 +354,13 @@ def _sync_validate_candidate(candidate: Dict[str, Any]) -> Tuple[str, str]:
                     f"응답 신호가 부족합니다. status={response.status_code}, "
                     f"content-type={content_type}, body_len={len(text.strip())}"
                 )
+
+            if not validate_list_response(
+                candidate.get("_requested_list_url") or api_url,
+                getattr(response, "url", None) or api_url,
+                text,
+            ):
+                return "semantic_failed", "요청한 갤러리의 개념글 필터가 응답에 유지되지 않았습니다."
 
             head = text.lstrip()[:120]
             if head.startswith("{"):
@@ -304,10 +388,26 @@ def _sync_validate_candidate(candidate: Dict[str, Any]) -> Tuple[str, str]:
                 )
             )
             if has_semantic_list:
+                response_url = getattr(response, "url", None)
+                if not isinstance(response_url, str) or not response_url:
+                    response_url = api_url
+                candidate["_validated_response_snapshot"] = {
+                    "body_text": text,
+                    "content_type": content_type,
+                    "response_url": response_url,
+                    "status_code": response.status_code,
+                    "transfer_bytes": (
+                        response_metrics.transfer_bytes
+                        if response_metrics is not None
+                        else None
+                    ),
+                    "decoded_bytes": len(text.encode("utf-8")),
+                }
                 return (
                     "passed",
                     f"의미 검증 성공 ({method} {source_kind}, "
-                    f"records={analysis['semantic_record_count']})",
+                    f"records={analysis['semantic_record_count']}"
+                    f"{size_summary})",
                 )
 
             return "semantic_failed", (
@@ -315,6 +415,7 @@ def _sync_validate_candidate(candidate: Dict[str, Any]) -> Tuple[str, str]:
                 f"kind={analysis['analysis_kind']}, "
                 f"records={analysis['semantic_record_count']}, "
                 f"keys={analysis['data_key_hits']}"
+                f"{size_summary}"
             )
         finally:
             response.close()
@@ -334,7 +435,11 @@ async def validate_candidate(candidate: Dict[str, Any]) -> Tuple[str, str]:
     return await asyncio.to_thread(_sync_validate_candidate, candidate)
 
 
-async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
+async def find_api(
+    target_url: str,
+    *,
+    site_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     logger.info("🚀 [find_api 시작] 타겟 URL: %s", target_url)
 
     try:
@@ -343,8 +448,22 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
         logger.warning("사용자 URL 보안 검증 실패: %s", exc)
         return None
 
-    cached_api = notice_repo.select_api(target_url)
+    # 예약 크롤링은 등록 시점에 확정한 site_id를 전달한다. 단축 URL이나
+    # 리다이렉트 URL은 target_url 문자열이 바뀔 수 있으므로 site_id 캐시를
+    # 먼저 조회하고, site_id가 없거나 아직 API가 저장되지 않은 경우에만
+    # 기존 URL 조회로 폴백한다.
+    cached_api = (
+        notice_repo.select_api_by_site_id(site_id)
+        if site_id is not None
+        else None
+    )
+    if cached_api is None:
+        cached_api = notice_repo.select_api(target_url)
     if cached_api:
+        cached_api = dict(cached_api)
+        source_changed = _prepare_list_candidate(cached_api, target_url)
+        if site_id is not None:
+            cached_api["site_id"] = site_id
         logger.info("🔎 [DB 조회] 저장된 API를 의미 기준으로 재검증합니다.")
         cached_status, cached_reason = await validate_candidate(cached_api)
         logger.info("🔎 [캐시 검증] status=%s | %s", cached_status, cached_reason)
@@ -355,21 +474,55 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
                 validation_status="valid",
                 validation_error=None,
             )
-            cached_api["_pending_persistence"] = False
+            cached_api["_pending_persistence"] = source_changed
             return cached_api
         logger.warning("⚠️ 저장된 API가 의미 검증에 실패하여 후보를 다시 탐색합니다.")
 
     logger.info("🔍 [DB 조회] 저장된 API가 없습니다. 신규 사이트 등록 및 분석을 시작합니다.")
-    site_id = notice_repo.select_site_id(target_url)
-    if not site_id:
-        site_id = save_site(target_url)
+    if site_id is None:
+        site_id = notice_repo.select_site_id(target_url)
+        if not site_id:
+            site_id = save_site(target_url)
 
     if not site_id:
         logger.error("사이트 ID 확보 실패: %s", target_url)
         return None
 
     candidates = await collect_candidates(target_url)
+    for candidate in candidates:
+        _prepare_list_candidate(candidate, target_url)
     logger.info("수집된 API 후보 개수: %d", len(candidates))
+
+    access_blocked_candidates = [
+        candidate for candidate in candidates if candidate.get("access_blocked")
+    ]
+    candidates = [
+        candidate for candidate in candidates if not candidate.get("access_blocked")
+    ]
+
+    if not candidates and access_blocked_candidates:
+        failure_reason = str(
+            access_blocked_candidates[0].get("access_block_reason")
+            or "원격 사이트가 기술적으로 접근을 제한했습니다."
+        )
+        logger.warning("사이트 접근 차단으로 후보 수집을 종료합니다: %s", failure_reason)
+        _record_selection_failure(
+            site_id,
+            candidate_count=len(access_blocked_candidates),
+            selection_decision="reject_access_blocked",
+            selection_reason=failure_reason,
+            candidates=access_blocked_candidates,
+            error_code="SITE_ACCESS_BLOCKED",
+            run_status="blocked",
+        )
+        notice_repo.update_site_crawl_state(
+            site_id,
+            crawl_status="blocked",
+            validation_status="valid",
+            validation_error_code="SITE_ACCESS_BLOCKED",
+            validation_error=failure_reason,
+        )
+        return None
 
     if not candidates:
         logger.warning("수집된 API 후보가 없습니다.")
@@ -384,6 +537,7 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
             site_id,
             crawl_status="failed",
             validation_status="valid",
+            validation_error_code="NO_NOTICE_SOURCE",
             validation_error="수집된 API 후보가 없습니다.",
         )
         return None
@@ -395,6 +549,7 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
         limit=MAX_VALIDATION_CANDIDATES,
     )
     validated_candidates = []
+    validation_access_blocks = []
     for position, candidate in enumerate(replay_pool, start=1):
         method = (candidate.get("method_type") or "GET").upper()
         features = candidate.get("features") or {}
@@ -421,8 +576,36 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
         )
         if validation_status == "passed":
             validated_candidates.append(candidate)
+        elif validation_status == "access_blocked":
+            validation_access_blocks.append(candidate)
 
     if not validated_candidates:
+        if validation_access_blocks:
+            failure_reason = str(
+                validation_access_blocks[0].get("validation_reason")
+                or "원격 사이트가 기술적으로 접근을 제한했습니다."
+            )
+            logger.warning(
+                "사이트 접근 차단으로 후보 검증을 종료합니다: %s",
+                failure_reason,
+            )
+            _record_selection_failure(
+                site_id,
+                candidate_count=len(candidates),
+                selection_decision="reject_access_blocked",
+                selection_reason=failure_reason,
+                candidates=replay_pool,
+                error_code="SITE_ACCESS_BLOCKED",
+                run_status="blocked",
+            )
+            notice_repo.update_site_crawl_state(
+                site_id,
+                crawl_status="blocked",
+                validation_status="valid",
+                validation_error_code="SITE_ACCESS_BLOCKED",
+                validation_error=failure_reason,
+            )
+            return None
         logger.warning("보안·재현·의미 gate를 통과한 후보가 없습니다.")
         failure_reason = "API 후보 사전 검증에 실패했습니다."
         _record_selection_failure(
@@ -437,6 +620,7 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
             site_id,
             crawl_status="failed",
             validation_status="valid",
+            validation_error_code="SITE_VALIDATION_FAILED",
             validation_error=failure_reason,
         )
         return None
@@ -467,6 +651,7 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
             site_id,
             crawl_status="failed",
             validation_status="valid",
+            validation_error_code="NO_NOTICE_SOURCE",
             validation_error=selection_reason,
         )
         return None
@@ -478,20 +663,40 @@ async def find_api(target_url: str) -> Optional[Dict[str, Any]]:
     if selected_api.get("selection_mode"):
         logger.info("선택 모드: %s", selected_api.get("selection_mode"))
 
-    selected_api["site_id"] = site_id
-    selected_api["_candidate_count"] = len(candidates)
-    selected_api["_llm_used"] = selected_api.get("selection_mode") == "llm"
-    selected_api["selection_decision"] = (
-        selected_api.get("selection_decision") or selection_decision
-    )
-    selected_api["selection_reason"] = (
-        selected_api.get("selection_reason") or selection_reason
-    )
-    selected_api["_candidate_evidence"] = build_candidate_evidence(
+    candidate_evidence = build_candidate_evidence(
         replay_pool,
         selected_candidate_index=selected_api.get("api_index"),
     )
-    selected_api["_pending_persistence"] = True
+    prepared_candidates = []
+    for attempt_index, candidate in enumerate(
+        prioritized_candidates[:MAX_EXTRACTION_CANDIDATE_ATTEMPTS],
+        start=1,
+    ):
+        prepared = dict(candidate)
+        prepared["site_id"] = site_id
+        prepared["_candidate_count"] = len(candidates)
+        prepared["_llm_used"] = (
+            attempt_index == 1 and prepared.get("selection_mode") == "llm"
+        )
+        prepared["selection_decision"] = (
+            prepared.get("selection_decision") or selection_decision
+        )
+        prepared["selection_reason"] = (
+            prepared.get("selection_reason")
+            or (
+                selection_reason
+                if attempt_index == 1
+                else f"추출 후보 {attempt_index}순위 재시도"
+            )
+        )
+        if attempt_index > 1:
+            prepared["selection_mode"] = "extraction_fallback"
+        prepared["_candidate_evidence"] = candidate_evidence
+        prepared["_pending_persistence"] = True
+        prepared_candidates.append(prepared)
+
+    selected_api = prepared_candidates[0]
+    selected_api["_fallback_candidates"] = prepared_candidates[1:]
     notice_repo.update_site_crawl_state(
         site_id,
         crawl_status="pending",

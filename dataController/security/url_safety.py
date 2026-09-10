@@ -1,15 +1,24 @@
 import ipaddress
+import logging
+import os
 import socket
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Optional, Sequence
+from typing import Callable, Dict, Iterable, Mapping, Optional, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 
 
+logger = logging.getLogger(__name__)
+
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 ALLOWED_PORTS = frozenset({80, 443})
 REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+DEFAULT_MAX_TRANSFER_BYTES = 5 * 1024 * 1024
+DEFAULT_MAX_DECODED_BYTES = 5 * 1024 * 1024
+MAX_CONFIGURABLE_RESPONSE_BYTES = 64 * 1024 * 1024
+TRANSFER_LIMIT_ENV = "CRAWLER_MAX_TRANSFER_BYTES"
+DECODED_LIMIT_ENV = "CRAWLER_MAX_DECODED_BYTES"
 SENSITIVE_HEADER_NAMES = frozenset(
     {
         "authorization",
@@ -28,7 +37,87 @@ class UnsafeUrlError(ValueError):
 
 
 class ResponseTooLargeError(ValueError):
-    """Raised when a crawler response exceeds the configured byte limit."""
+    """Raised with bounded response metadata when a size limit is exceeded."""
+
+    def __init__(
+        self,
+        *,
+        limit_kind: str,
+        observed_bytes: int,
+        limit_bytes: int,
+        content_type: str = "",
+        content_encoding: str = "",
+    ) -> None:
+        self.limit_kind = limit_kind
+        self.observed_bytes = observed_bytes
+        self.limit_bytes = limit_bytes
+        self.content_type = content_type or "unknown"
+        self.content_encoding = content_encoding or "identity"
+        super().__init__(
+            "응답 크기 제한을 초과했습니다. "
+            f"kind={self.limit_kind}, "
+            f"observed_bytes={self.observed_bytes}, "
+            f"limit_bytes={self.limit_bytes}, "
+            f"content_type={self.content_type}, "
+            f"content_encoding={self.content_encoding}"
+        )
+
+
+@dataclass(frozen=True)
+class ResponseLimitPolicy:
+    max_transfer_bytes: int
+    max_decoded_bytes: int
+
+
+@dataclass(frozen=True)
+class ResponseSizeMetrics:
+    transfer_bytes: int
+    decoded_bytes: int
+    content_type: str
+    content_encoding: str
+
+
+def _configured_byte_limit(
+    environ: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    raw_value = environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("%s 값이 정수가 아니어서 기본값 %d를 사용합니다.", name, default)
+        return default
+    if value <= 0 or value > MAX_CONFIGURABLE_RESPONSE_BYTES:
+        logger.warning(
+            "%s 값은 1~%d bytes 범위여야 하므로 기본값 %d를 사용합니다.",
+            name,
+            MAX_CONFIGURABLE_RESPONSE_BYTES,
+            default,
+        )
+        return default
+    return value
+
+
+def load_response_limit_policy(
+    environ: Optional[Mapping[str, str]] = None,
+) -> ResponseLimitPolicy:
+    """Load finite crawler response limits from the process environment."""
+    source = os.environ if environ is None else environ
+    return ResponseLimitPolicy(
+        max_transfer_bytes=_configured_byte_limit(
+            source,
+            TRANSFER_LIMIT_ENV,
+            DEFAULT_MAX_TRANSFER_BYTES,
+        ),
+        max_decoded_bytes=_configured_byte_limit(
+            source,
+            DECODED_LIMIT_ENV,
+            DEFAULT_MAX_DECODED_BYTES,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -192,6 +281,185 @@ def _validate_connected_peer(
         raise UnsafeUrlError("DNS 검증 결과와 실제 연결 peer가 일치하지 않습니다.")
 
 
+def _bounded_header_value(value: Optional[str], fallback: str) -> str:
+    compact = " ".join(str(value or "").split())[:160]
+    return compact or fallback
+
+
+def _response_metadata(response: requests.Response) -> tuple[str, str]:
+    return (
+        _bounded_header_value(response.headers.get("Content-Type"), "unknown"),
+        _bounded_header_value(response.headers.get("Content-Encoding"), "identity"),
+    )
+
+
+def _raw_transfer_bytes(response: requests.Response) -> Optional[int]:
+    raw = getattr(response, "raw", None)
+    if raw is None:
+        return None
+    try:
+        value = raw.tell()
+    except (AttributeError, OSError, TypeError, ValueError):
+        value = getattr(raw, "_fp_bytes_read", None)
+    try:
+        return max(0, int(value)) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _response_too_large(
+    response: requests.Response,
+    *,
+    limit_kind: str,
+    observed_bytes: int,
+    limit_bytes: int,
+) -> ResponseTooLargeError:
+    content_type, content_encoding = _response_metadata(response)
+    response.close()
+    return ResponseTooLargeError(
+        limit_kind=limit_kind,
+        observed_bytes=observed_bytes,
+        limit_bytes=limit_bytes,
+        content_type=content_type,
+        content_encoding=content_encoding,
+    )
+
+
+def _append_decoded_chunk(
+    response: requests.Response,
+    content: bytearray,
+    chunk: bytes,
+    decoded_limit: int,
+) -> None:
+    if len(content) + len(chunk) > decoded_limit:
+        raise _response_too_large(
+            response,
+            limit_kind="decoded_streamed",
+            observed_bytes=len(content) + len(chunk),
+            limit_bytes=decoded_limit,
+        )
+    content.extend(chunk)
+
+
+def _decoder_output(decoder, data: bytes, remaining: int) -> bytes:
+    try:
+        return decoder.decompress(data, max_length=max(remaining + 1, 1))
+    except TypeError:  # urllib3 1.x decoder compatibility
+        return decoder.decompress(data)
+
+
+def _read_bounded_content(
+    response: requests.Response,
+    *,
+    transfer_limit: int,
+    decoded_limit: int,
+) -> tuple[bytes, int]:
+    """Count encoded bytes and bound decoder output before buffering it."""
+    content = bytearray()
+    transfer_bytes = 0
+    raw = getattr(response, "raw", None)
+    can_decode_raw = bool(
+        raw is not None
+        and hasattr(raw, "stream")
+        and hasattr(raw, "_init_decoder")
+    )
+
+    if can_decode_raw:
+        raw._init_decoder()
+        decoder = getattr(raw, "_decoder", None)
+        for encoded_chunk in raw.stream(
+            amt=64 * 1024,
+            decode_content=False,
+        ):
+            if not encoded_chunk:
+                continue
+            transfer_bytes += len(encoded_chunk)
+            if transfer_bytes > transfer_limit:
+                raise _response_too_large(
+                    response,
+                    limit_kind="transfer_streamed",
+                    observed_bytes=transfer_bytes,
+                    limit_bytes=transfer_limit,
+                )
+            decoded_chunk = (
+                _decoder_output(
+                    decoder,
+                    encoded_chunk,
+                    decoded_limit - len(content),
+                )
+                if decoder is not None
+                else encoded_chunk
+            )
+            _append_decoded_chunk(
+                response,
+                content,
+                decoded_chunk,
+                decoded_limit,
+            )
+
+        while decoder is not None and getattr(
+            decoder,
+            "has_unconsumed_tail",
+            False,
+        ):
+            previous_length = len(content)
+            decoded_chunk = _decoder_output(
+                decoder,
+                b"",
+                decoded_limit - len(content),
+            )
+            _append_decoded_chunk(
+                response,
+                content,
+                decoded_chunk,
+                decoded_limit,
+            )
+            if len(content) == previous_length:
+                break
+        if decoder is not None:
+            _append_decoded_chunk(
+                response,
+                content,
+                decoder.flush(),
+                decoded_limit,
+            )
+        return bytes(content), transfer_bytes
+
+    raw_transfer_available = _raw_transfer_bytes(response) is not None
+    for decoded_chunk in response.iter_content(chunk_size=64 * 1024):
+        if not decoded_chunk:
+            continue
+        observed_transfer = _raw_transfer_bytes(response)
+        if observed_transfer is not None:
+            transfer_bytes = max(transfer_bytes, observed_transfer)
+        elif response.headers.get("Content-Encoding", "identity").lower() in {
+            "",
+            "identity",
+        }:
+            transfer_bytes += len(decoded_chunk)
+        if transfer_bytes > transfer_limit:
+            raise _response_too_large(
+                response,
+                limit_kind="transfer_streamed",
+                observed_bytes=transfer_bytes,
+                limit_bytes=transfer_limit,
+            )
+        _append_decoded_chunk(
+            response,
+            content,
+            decoded_chunk,
+            decoded_limit,
+        )
+    if not raw_transfer_available:
+        declared_length = response.headers.get("Content-Length")
+        if declared_length:
+            try:
+                transfer_bytes = int(declared_length)
+            except ValueError:
+                pass
+    return bytes(content), transfer_bytes
+
+
 def safe_request(
     session: requests.Session,
     method: str,
@@ -203,10 +471,31 @@ def safe_request(
     data=None,
     timeout: float = 15,
     max_redirects: int = 5,
-    max_response_bytes: int = 700_000,
+    max_response_bytes: Optional[int] = None,
+    max_transfer_bytes: Optional[int] = None,
+    limit_policy: Optional[ResponseLimitPolicy] = None,
     validator: Callable[[str], ValidatedUrl] = validate_public_url,
+    read_body: bool = True,
 ) -> requests.Response:
     """Perform a bounded request while validating every redirect hop."""
+    policy = limit_policy or load_response_limit_policy()
+    decoded_limit = (
+        max_response_bytes
+        if max_response_bytes is not None
+        else policy.max_decoded_bytes
+    )
+    transfer_limit = (
+        max_transfer_bytes
+        if max_transfer_bytes is not None
+        else (
+            max_response_bytes
+            if max_response_bytes is not None
+            else policy.max_transfer_bytes
+        )
+    )
+    if decoded_limit <= 0 or transfer_limit <= 0:
+        raise ValueError("응답 크기 제한은 0보다 커야 합니다.")
+
     current_url = url
     current_method = method.upper()
     current_json = json
@@ -245,25 +534,40 @@ def safe_request(
                 current_data = None
             continue
 
-        declared_length = response.headers.get("Content-Length")
-        if declared_length and current_method != "HEAD":
-            try:
-                if int(declared_length) > max_response_bytes:
-                    response.close()
-                    raise ResponseTooLargeError("응답 크기 제한을 초과했습니다.")
-            except ValueError:
-                pass
+        skip_body = current_method == "HEAD" or not read_body
 
-        content = bytearray()
-        if current_method != "HEAD":
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                content.extend(chunk)
-                if len(content) > max_response_bytes:
-                    response.close()
-                    raise ResponseTooLargeError("응답 크기 제한을 초과했습니다.")
-        response._content = bytes(content)
+        declared_length = response.headers.get("Content-Length")
+        if declared_length and not skip_body:
+            try:
+                declared_bytes = int(declared_length)
+            except ValueError:
+                declared_bytes = None
+            if declared_bytes is not None and declared_bytes > transfer_limit:
+                raise _response_too_large(
+                    response,
+                    limit_kind="transfer_declared",
+                    observed_bytes=declared_bytes,
+                    limit_bytes=transfer_limit,
+                )
+
+        content = b""
+        transfer_bytes = 0
+        if not skip_body:
+            content, transfer_bytes = _read_bounded_content(
+                response,
+                transfer_limit=transfer_limit,
+                decoded_limit=decoded_limit,
+            )
+        elif current_method != "HEAD":
+            response.close()
+        content_type, content_encoding = _response_metadata(response)
+        response._response_size_metrics = ResponseSizeMetrics(
+            transfer_bytes=transfer_bytes,
+            decoded_bytes=len(content),
+            content_type=content_type,
+            content_encoding=content_encoding,
+        )
+        response._content = content
         response._content_consumed = True
         response.url = validated.url
         return response

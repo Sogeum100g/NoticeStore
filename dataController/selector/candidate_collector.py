@@ -9,7 +9,14 @@ from urllib.parse import parse_qs, urlparse
 
 from playwright.async_api import async_playwright
 
-from dataController.security.url_safety import UnsafeUrlError, validate_public_url
+from dataController.security.url_safety import (
+    ResponseLimitPolicy,
+    ResponseTooLargeError,
+    UnsafeUrlError,
+    load_response_limit_policy,
+    validate_public_url,
+)
+from dataController.security.site_access import site_access_block_reason
 
 try:
     from .candidate_analyzer import analyze_candidate_body
@@ -22,7 +29,10 @@ CURRENT_DIR = Path(__file__).resolve().parent
 SCRAPE_DIR = CURRENT_DIR.parent
 TAG_PATH = SCRAPE_DIR / "tag.json"
 
-ABORT_RESOURCE_TYPES = {"image", "stylesheet", "media", "font"}
+# Lazy-loaded SPA routes can wait for their CSS chunk before initializing the
+# component. Blocking stylesheets can therefore suppress the data API calls we
+# are trying to observe. CSS is still skipped as a candidate below.
+ABORT_RESOURCE_TYPES = {"image", "media", "font"}
 SKIP_RESOURCE_TYPES = {"image", "stylesheet", "media", "font", "websocket"}
 TRASH_EXTENSIONS = (
     ".js", ".mjs", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg",
@@ -47,9 +57,17 @@ DROP_REQUEST_HEADERS = {
     "cookie", "content-length", "content-encoding", "host", "connection",
     "accept-encoding", "cache-control"
 }
-MAX_TEXT_READ_BYTES = 700_000
 MIN_TEXTUAL_BODY_BYTES = 80
 MAX_CANDIDATES = 20
+# Playwright's default Chromium UA advertises itself as "HeadlessChrome",
+# which some sites' bot-mitigation WAFs reject outright (e.g. nodong.org
+# returns 403 for it) even though their robots.txt permits crawling. A
+# regular desktop Chrome UA matches what scrape_auto._build_validation_headers
+# already sends for the actual re-crawl request.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
 KEYWORD_HINTS = (
     "공지", "notice", "조회수", "첨부파일", "게시", "board", "title", "subject", "list"
 )
@@ -83,6 +101,77 @@ def _sanitize_headers(headers: Dict[str, str]) -> Dict[str, str]:
 
 def _normalize_whitespace(text: str) -> str:
     return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
+def _response_charset(content_type: str) -> str:
+    match = re.search(r"charset\s*=\s*['\"]?([^;'\"\s]+)", content_type or "", re.I)
+    return match.group(1).strip() if match else "utf-8"
+
+
+def _decode_response_body(body: bytes, content_type: str) -> str:
+    charset = _response_charset(content_type)
+    try:
+        return body.decode(charset, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
+async def _read_bounded_response_text(
+    response,
+    request,
+    policy: ResponseLimitPolicy,
+) -> Tuple[str, int, int]:
+    """Read a Playwright body while applying the shared transfer/decoded policy."""
+    content_type = response.headers.get("content-type", "")
+    content_encoding = response.headers.get("content-encoding", "") or "identity"
+    declared_length = response.headers.get("content-length")
+    declared_bytes: Optional[int] = None
+    if declared_length:
+        try:
+            declared_bytes = int(declared_length)
+        except ValueError:
+            declared_bytes = None
+    if (
+        declared_bytes is not None
+        and declared_bytes > policy.max_transfer_bytes
+    ):
+        raise ResponseTooLargeError(
+            limit_kind="transfer_declared",
+            observed_bytes=declared_bytes,
+            limit_bytes=policy.max_transfer_bytes,
+            content_type=content_type,
+            content_encoding=content_encoding,
+        )
+
+    body = await response.body()
+    decoded_bytes = len(body)
+    if decoded_bytes > policy.max_decoded_bytes:
+        raise ResponseTooLargeError(
+            limit_kind="decoded_buffered",
+            observed_bytes=decoded_bytes,
+            limit_bytes=policy.max_decoded_bytes,
+            content_type=content_type,
+            content_encoding=content_encoding,
+        )
+
+    transfer_bytes = declared_bytes or 0
+    try:
+        sizes = await request.sizes()
+        measured_transfer = int(sizes.get("responseBodySize") or 0)
+        if measured_transfer > 0:
+            transfer_bytes = measured_transfer
+    except Exception:
+        pass
+    if transfer_bytes > policy.max_transfer_bytes:
+        raise ResponseTooLargeError(
+            limit_kind="transfer_measured",
+            observed_bytes=transfer_bytes,
+            limit_bytes=policy.max_transfer_bytes,
+            content_type=content_type,
+            content_encoding=content_encoding,
+        )
+
+    return _decode_response_body(body, content_type), transfer_bytes, decoded_bytes
 
 
 def _parse_body_payload(raw_payload: Optional[str]) -> Tuple[Optional[Dict[str, Any]], str]:
@@ -304,9 +393,12 @@ async def collect_candidates(
 
     tag_data = _load_tag_data()
     global_trash_keywords = tag_data.get("GLOBAL_TRASH_KEYWORDS", [])
+    response_limits = load_response_limit_policy()
+    target_hostname = (urlparse(target_url).hostname or "").casefold()
 
     candidates: List[Dict[str, Any]] = []
     seen_keys = set()
+    seen_access_block_urls = set()
     api_index = 1
     last_candidate_at = time.monotonic()
 
@@ -314,7 +406,7 @@ async def collect_candidates(
         browser = None
         try:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            page = await browser.new_page(user_agent=BROWSER_USER_AGENT)
         except Exception:
             logger.error("❌ 브라우저 초기화 실패", exc_info=True)
             if browser:
@@ -364,6 +456,47 @@ async def collect_candidates(
             if any(trash in request.url for trash in global_trash_keywords):
                 return
 
+            access_block_reason = site_access_block_reason(
+                status_code=response.status,
+                url=request.url,
+            )
+            request_hostname = (parsed_req_url.hostname or "").casefold()
+            is_known_challenge_url = bool(
+                site_access_block_reason(url=request.url)
+            )
+            is_relevant_blocked_document = (
+                resource_type == "document"
+                and (
+                    request_hostname == target_hostname
+                    or is_known_challenge_url
+                )
+            )
+            if access_block_reason and is_relevant_blocked_document:
+                dedupe_key = ("access_blocked", method, request.url)
+                if request.url not in seen_access_block_urls:
+                    seen_access_block_urls.add(request.url)
+                    seen_keys.add(dedupe_key)
+                    candidates.append(
+                        {
+                            "api_index": api_index,
+                            "method_type": method,
+                            "type": resource_type,
+                            "source_kind": "access_challenge",
+                            "api_url": request.url,
+                            "status": response.status,
+                            "access_blocked": True,
+                            "access_block_reason": access_block_reason,
+                        }
+                    )
+                    api_index += 1
+                    last_candidate_at = time.monotonic()
+                    logger.warning(
+                        "🚫 사이트 접근 차단 응답 감지 | status=%s url=%s",
+                        response.status,
+                        request.url,
+                    )
+                return
+
             content_type = response.headers.get("content-type", "").lower()
             if not _looks_textual(content_type, resource_type, request.url):
                 return
@@ -385,22 +518,30 @@ async def collect_candidates(
             if dedupe_key in seen_keys:
                 return
 
-            content_length = response.headers.get("content-length")
-            if content_length:
-                try:
-                    if int(content_length) < MIN_TEXTUAL_BODY_BYTES:
-                        return
-                    if int(content_length) > MAX_TEXT_READ_BYTES:
-                        body_text = ""
-                    else:
-                        body_text = await response.text()
-                except Exception:
-                    body_text = ""
-            else:
-                try:
-                    body_text = await response.text()
-                except Exception:
-                    body_text = ""
+            try:
+                body_text, transfer_bytes, decoded_bytes = (
+                    await _read_bounded_response_text(
+                        response,
+                        request,
+                        response_limits,
+                    )
+                )
+            except ResponseTooLargeError as exc:
+                logger.warning(
+                    "후보 응답 크기 제한 초과로 제외 | url=%s | %s",
+                    request.url,
+                    exc,
+                )
+                return
+            except Exception:
+                logger.warning(
+                    "후보 응답 본문 읽기 실패 | url=%s",
+                    request.url,
+                    exc_info=True,
+                )
+                return
+            if decoded_bytes < MIN_TEXTUAL_BODY_BYTES:
+                return
 
             body_shape = _detect_body_shape(body_text)
             parsed_jsonp = _extract_jsonp_payload(body_text) if body_shape == "jsonp_wrapper" else None
@@ -409,6 +550,41 @@ async def collect_candidates(
                 body_shape=body_shape,
                 content_type=content_type,
             )
+            access_block_reason = site_access_block_reason(
+                status_code=response.status,
+                url=request.url,
+                body_text=body_text,
+            )
+            if (
+                access_block_reason
+                and not body_analysis["has_repeated_records"]
+            ):
+                if request.url in seen_access_block_urls:
+                    return
+                seen_access_block_urls.add(request.url)
+                seen_keys.add(dedupe_key)
+                candidates.append(
+                    {
+                        "api_index": api_index,
+                        "method_type": method,
+                        "type": resource_type,
+                        "source_kind": "access_challenge",
+                        "api_url": request.url,
+                        "status": response.status,
+                        "content_type": content_type,
+                        "transfer_bytes": transfer_bytes,
+                        "decoded_bytes": decoded_bytes,
+                        "access_blocked": True,
+                        "access_block_reason": access_block_reason,
+                    }
+                )
+                api_index += 1
+                last_candidate_at = time.monotonic()
+                logger.warning(
+                    "🚫 사이트 보안 인증 문서 감지 | url=%s",
+                    request.url,
+                )
+                return
             data_key_hits = body_analysis["data_key_hits"]
 
             if not _should_keep_candidate(
@@ -448,7 +624,13 @@ async def collect_candidates(
                 "payload_format": payload_format,
                 "status": response.status,
                 "content_type": content_type,
-                "length": len(body_text),
+                "content_encoding": response.headers.get(
+                    "content-encoding",
+                    "identity",
+                ),
+                "transfer_bytes": transfer_bytes,
+                "decoded_bytes": decoded_bytes,
+                "length": decoded_bytes,
                 "sample": body_analysis["semantic_sample"] or _extract_informative_sample(
                     body_text,
                     limit=400,
