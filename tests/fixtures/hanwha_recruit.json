@@ -1,0 +1,22 @@
+{
+  "success": true,
+  "data": {
+    "filteredCount": 2,
+    "list": [
+      {
+        "sdNm": "(주)한화 글로벌부문",
+        "rtNm": "여수사업장 공무 엔지니어 경력사원 채용",
+        "rtAcptStrtDttm": "2026.08.13 17:30",
+        "rtAcptEndDttm": "2026.08.26 15:00",
+        "rtSeq": 19483
+      },
+      {
+        "sdNm": "한화투자증권",
+        "rtNm": "경영기획팀 경력직 채용",
+        "rtAcptStrtDttm": "2026.08.13 17:00",
+        "rtAcptEndDttm": "2026.08.26 23:59",
+        "rtSeq": 19482
+      }
+    ]
+  }
+}
