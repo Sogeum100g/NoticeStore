@@ -17,8 +17,9 @@ class NicknameRequest(BaseModel):
 
 class NotificationSettingsRequest(BaseModel):
     is_notification_enabled: Optional[bool] = None
-    notification_time: Optional[str] = None
-    fcm_token: Optional[str] = None
+
+class SubscriptionNotificationRequest(BaseModel):
+    notification_enabled: bool
 
 class FCMTokenRequest(BaseModel):
     fcm_token: str
@@ -37,6 +38,8 @@ class SiteResponse(BaseModel):
     status: str  # "success" 반환용
     message: str
     site_id: int
+    crawl_status: str
+    registration_completed: bool
 
 # --- [즐겨찾기 폴더 및 공지 관련] ---
 class FolderCreateRequest(BaseModel):

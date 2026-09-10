@@ -17,9 +17,11 @@ async def read_notices(user_id: int = Depends(get_current_user_id)):
             "title": row['title'],
             "author": row['author'] or "",
             "url": row['url'],
+            "published_at": row['published_at'].isoformat() if row['published_at'] else "",
             "created_at": row['created_at'].isoformat() if row['created_at'] else "",
             "scraped_at": row['scraped_at'].isoformat() if row['scraped_at'] else "",
-            "site_id": row['site_id']
+            "site_id": row['site_id'],
+            "is_new": bool(row['is_new']),
         })
 
     return {"status": "success", "notices": formatted_notices}

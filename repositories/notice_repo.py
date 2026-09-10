@@ -1,4 +1,6 @@
 import datetime
+import hashlib
+import json
 import psycopg
 from typing import Optional, List, Dict, Any
 from psycopg.rows import dict_row
@@ -6,6 +8,10 @@ from psycopg.types.json import Jsonb
 
 # 공통 DB 커넥션 매니저 임포트
 from repositories.db_manager import get_db_connection
+from repositories.notification_repo import create_notification_events_with_cursor
+from dataController.scraper.navigation.url_normalizer import (
+    canonicalize_notice_detail_url,
+)
 
 # --- [1. 사이트(Site) 및 크롤링 API 관리] ---
 
@@ -16,6 +22,7 @@ def insert_site(
     submitted_url: Optional[str] = None,
     crawl_status: str = "pending",
     validation_status: Optional[str] = None,
+    validation_error_code: Optional[str] = None,
     validation_error: Optional[str] = None,
 ) -> Optional[int]:
     """새로운 사이트를 등록하고 생성된 site_id를 반환합니다."""
@@ -26,9 +33,10 @@ def insert_site(
             query = """
                 INSERT INTO sites (
                     site_url, created_at, submitted_url, crawl_status,
-                    validation_status, validation_error, last_validated_at
+                    validation_status, validation_error_code,
+                    validation_error, last_validated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
                 ON CONFLICT (site_url)
                 DO UPDATE SET
                     submitted_url = COALESCE(sites.submitted_url, EXCLUDED.submitted_url)
@@ -42,6 +50,7 @@ def insert_site(
                     submitted_url or site_url,
                     crawl_status,
                     validation_status,
+                    validation_error_code,
                     validation_error,
                 ),
             )
@@ -90,6 +99,83 @@ def insert_api(site_id: int, method_type: str, api_url: str, headers: dict, payl
         conn.close()
 
 
+def _upsert_api_for_site_with_cursor(
+    cur,
+    *,
+    site_id: int,
+    method_type: str,
+    api_url: str,
+    headers: dict,
+    payload: dict,
+    last_hash: str,
+    extractor_config: Optional[dict] = None,
+    schema_hash: Optional[str] = None,
+    processing_status: Optional[str] = None,
+    extractor_confidence: Optional[float] = None,
+) -> Optional[int]:
+    """Upsert one API without owning the surrounding transaction."""
+    if not site_id:
+        return None
+    cur.execute(
+        """
+        UPDATE api
+        SET method_type = %s,
+            api_url = %s,
+            headers = %s,
+            payload = %s,
+            last_hash = %s,
+            extractor_config = COALESCE(%s, extractor_config),
+            schema_hash = COALESCE(%s, schema_hash),
+            processing_status = COALESCE(%s, processing_status),
+            extractor_confidence = COALESCE(%s, extractor_confidence),
+            scraped_at = NOW()
+        WHERE site_id = %s
+        RETURNING api_id;
+        """,
+        (
+            method_type,
+            api_url,
+            Jsonb(headers or {}),
+            Jsonb(payload or {}),
+            last_hash,
+            Jsonb(extractor_config) if extractor_config is not None else None,
+            schema_hash,
+            processing_status,
+            extractor_confidence,
+            site_id,
+        ),
+    )
+    updated = cur.fetchone()
+    if updated:
+        return updated[0]
+
+    cur.execute(
+        """
+        INSERT INTO api (
+            site_id, method_type, api_url, headers, payload,
+            created_at, scraped_at, last_hash, extractor_config,
+            schema_hash, processing_status, extractor_confidence
+        )
+        VALUES (%s, %s, %s, %s, %s, NOW(), NOW(), %s, %s, %s, %s, %s)
+        RETURNING api_id;
+        """,
+        (
+            site_id,
+            method_type,
+            api_url,
+            Jsonb(headers or {}),
+            Jsonb(payload or {}),
+            last_hash,
+            Jsonb(extractor_config) if extractor_config is not None else None,
+            schema_hash,
+            processing_status,
+            extractor_confidence,
+        ),
+    )
+    inserted = cur.fetchone()
+    return inserted[0] if inserted else None
+
+
 def upsert_api_for_site(
     site_id: int,
     method_type: str,
@@ -108,68 +194,21 @@ def upsert_api_for_site(
         return None
     try:
         with conn.cursor() as cur:
-            update_query = """
-                UPDATE api
-                SET method_type = %s,
-                    api_url = %s,
-                    headers = %s,
-                    payload = %s,
-                    last_hash = %s,
-                    extractor_config = COALESCE(%s, extractor_config),
-                    schema_hash = COALESCE(%s, schema_hash),
-                    processing_status = COALESCE(%s, processing_status),
-                    extractor_confidence = COALESCE(%s, extractor_confidence),
-                    scraped_at = NOW()
-                WHERE site_id = %s
-                RETURNING api_id;
-            """
-            cur.execute(
-                update_query,
-                (
-                    method_type,
-                    api_url,
-                    Jsonb(headers or {}),
-                    Jsonb(payload or {}),
-                    last_hash,
-                    Jsonb(extractor_config) if extractor_config is not None else None,
-                    schema_hash,
-                    processing_status,
-                    extractor_confidence,
-                    site_id,
-                ),
+            api_id = _upsert_api_for_site_with_cursor(
+                cur,
+                site_id=site_id,
+                method_type=method_type,
+                api_url=api_url,
+                headers=headers,
+                payload=payload,
+                last_hash=last_hash,
+                extractor_config=extractor_config,
+                schema_hash=schema_hash,
+                processing_status=processing_status,
+                extractor_confidence=extractor_confidence,
             )
-            updated = cur.fetchone()
-            if updated:
-                conn.commit()
-                return updated[0]
-
-            insert_query = """
-                INSERT INTO api (
-                    site_id, method_type, api_url, headers, payload,
-                    created_at, scraped_at, last_hash, extractor_config,
-                    schema_hash, processing_status, extractor_confidence
-                )
-                VALUES (%s, %s, %s, %s, %s, NOW(), NOW(), %s, %s, %s, %s, %s)
-                RETURNING api_id;
-            """
-            cur.execute(
-                insert_query,
-                (
-                    site_id,
-                    method_type,
-                    api_url,
-                    Jsonb(headers or {}),
-                    Jsonb(payload or {}),
-                    last_hash,
-                    Jsonb(extractor_config) if extractor_config is not None else None,
-                    schema_hash,
-                    processing_status,
-                    extractor_confidence,
-                ),
-            )
-            inserted = cur.fetchone()
             conn.commit()
-            return inserted[0] if inserted else None
+            return api_id
     except Exception as e:
         print(f"API 설정 upsert 중 에러 발생: {e}")
         conn.rollback()
@@ -234,6 +273,73 @@ def select_api(target_url: str) -> Optional[Dict[str, Any]]:
         return None
     finally:
         conn.close()
+
+
+def select_api_by_site_id(site_id: int) -> Optional[Dict[str, Any]]:
+    """등록 당시 확정한 site_id로 저장된 API 설정을 조회합니다.
+
+    단축 URL이나 리다이렉트 URL은 크롤링 전에 최종 URL로 전개될 수 있으므로,
+    예약 작업이 이미 site_id를 알고 있다면 URL 문자열보다 이 조회가 우선입니다.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT s.site_id, a.api_id, a.method_type, a.api_url,
+                       a.headers, a.payload, a.created_at, a.extractor_config,
+                       a.schema_hash, a.last_observed_hash,
+                       a.last_processed_hash, a.processing_status,
+                       a.retry_count, a.next_retry_at
+                FROM sites s
+                JOIN api a ON s.site_id = a.site_id
+                WHERE s.site_id = %s;
+                """,
+                (site_id,),
+            )
+            result = cur.fetchone()
+            if result:
+                print(f"[site_id={site_id}] 설정을 성공적으로 불러왔습니다.")
+                return result
+            print(f"[site_id={site_id}]에 해당하는 API 설정이 없습니다.")
+            return None
+    except Exception as e:
+        print(f"site_id 기반 API 데이터 불러오기 중 에러 발생: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def select_dcinside_rule_templates(exclude_site_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Return approved list rules only, without another site's request credentials."""
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT site_id, api_url, extractor_config
+                FROM api
+                WHERE api_url ~ '^https?://gall[.]dcinside[.]com/(mgallery/|mini/)?board/lists/?[?]'
+                  AND extractor_config->>'format' = 'agent_extractor_v1'
+                  AND extractor_config->'activation'->>'status' = 'active'
+                  AND extractor_config->'activation'->'evaluation'->>'decision' = 'pass'
+                  AND (%s::integer IS NULL OR site_id <> %s)
+                ORDER BY scraped_at DESC NULLS LAST, api_id DESC
+                LIMIT 5
+                """,
+                (exclude_site_id, exclude_site_id),
+            )
+            return cur.fetchall()
+    except Exception:
+        # Template lookup is optional; normal generation remains available.
+        return []
+    finally:
+        conn.close()
+
 
 def select_site_id(url: str) -> Optional[int]:
     """주어진 URL을 기반으로 sites 테이블에서 site_id를 조회합니다."""
@@ -391,6 +497,7 @@ def update_site_crawl_state(
     *,
     crawl_status: str,
     validation_status: Optional[str] = None,
+    validation_error_code: Optional[str] = None,
     validation_error: Optional[str] = None,
 ) -> None:
     conn = get_db_connection()
@@ -403,16 +510,68 @@ def update_site_crawl_state(
                 UPDATE sites
                 SET crawl_status = %s,
                     validation_status = COALESCE(%s, validation_status),
+                    validation_error_code = %s,
                     validation_error = %s,
                     last_validated_at = NOW()
                 WHERE site_id = %s;
                 """,
-                (crawl_status, validation_status, validation_error, site_id),
+                (
+                    crawl_status,
+                    validation_status,
+                    validation_error_code,
+                    validation_error,
+                    site_id,
+                ),
             )
             conn.commit()
     except Exception as exc:
         print(f"❌ 사이트 상태 업데이트 에러: {exc}")
         conn.rollback()
+    finally:
+        conn.close()
+
+
+def _activate_site_after_successful_sync_with_cursor(cur, site_id: int) -> None:
+    """Open the notification baseline without owning the transaction."""
+    cur.execute(
+        """
+        UPDATE user_subscriptions
+        SET last_synced_at = NOW(),
+            registration_completed_at = NOW()
+        WHERE site_id = %s
+          AND registration_completed_at IS NULL;
+        """,
+        (site_id,),
+    )
+    cur.execute(
+        """
+        UPDATE sites
+        SET crawl_status = 'active',
+            validation_status = 'valid',
+            validation_error_code = NULL,
+            validation_error = NULL,
+            last_validated_at = NOW()
+        WHERE site_id = %s;
+        """,
+        (site_id,),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError(f"활성화할 사이트를 찾지 못했습니다: {site_id}")
+
+
+def activate_site_after_successful_sync(site_id: int) -> None:
+    """최초 수집 기준선과 사이트 활성 상태를 하나의 트랜잭션으로 확정합니다."""
+    conn = get_db_connection()
+    if not conn:
+        raise RuntimeError("사이트 등록 완료 상태를 저장할 DB 연결이 없습니다.")
+    try:
+        with conn.cursor() as cur:
+            _activate_site_after_successful_sync_with_cursor(cur, site_id)
+            conn.commit()
+    except Exception as exc:
+        print(f"❌ 사이트 등록 완료 상태 확정 에러: {exc}")
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -423,7 +582,7 @@ def record_site_submission(
     submitted_url: str,
     validation_status: str = "valid",
 ) -> None:
-    """Dual-write the submitted URL without resetting an already active site."""
+    """Start a fresh registration attempt without resetting an active site."""
     conn = get_db_connection()
     if not conn:
         return
@@ -433,8 +592,12 @@ def record_site_submission(
                 """
                 UPDATE sites
                 SET submitted_url = %s,
-                    crawl_status = COALESCE(crawl_status, 'pending'),
+                    crawl_status = CASE
+                        WHEN crawl_status = 'active' THEN 'active'
+                        ELSE 'pending'
+                    END,
                     validation_status = %s,
+                    validation_error_code = NULL,
                     validation_error = NULL,
                     last_validated_at = NOW()
                 WHERE site_id = %s;
@@ -527,6 +690,11 @@ def finish_crawl_run(
     llm_input_tokens: Optional[int] = None,
     llm_output_tokens: Optional[int] = None,
     llm_cost: Optional[float] = None,
+    agent_stage_telemetry: Optional[List[Dict[str, Any]]] = None,
+    rule_activation_status: Optional[str] = None,
+    rule_activation_reason: Optional[str] = None,
+    evaluator_decision: Optional[str] = None,
+    evaluator_confidence: Optional[float] = None,
 ) -> None:
     if not crawl_run_id:
         return
@@ -535,37 +703,74 @@ def finish_crawl_run(
         return
     try:
         with conn.cursor() as cur:
+            assignments = [
+                "status = %s",
+                "observed_hash = %s",
+                "processed_hash = %s",
+                "schema_hash = %s",
+                "extracted_notice_count = %s",
+                "error_code = %s",
+                "error_message = %s",
+                "llm_used = COALESCE(%s, llm_used)",
+                "llm_input_tokens = COALESCE(%s, llm_input_tokens)",
+                "llm_output_tokens = COALESCE(%s, llm_output_tokens)",
+                "llm_cost = COALESCE(%s, llm_cost)",
+            ]
+            params: List[Any] = [
+                status,
+                observed_hash,
+                processed_hash,
+                schema_hash,
+                extracted_notice_count,
+                error_code,
+                error_message,
+                llm_used,
+                llm_input_tokens,
+                llm_output_tokens,
+                llm_cost,
+            ]
+            has_agent_telemetry = any(
+                value is not None
+                for value in (
+                    agent_stage_telemetry,
+                    rule_activation_status,
+                    rule_activation_reason,
+                    evaluator_decision,
+                    evaluator_confidence,
+                )
+            )
+            if has_agent_telemetry:
+                assignments.extend(
+                    [
+                        "agent_stage_telemetry = COALESCE(%s, agent_stage_telemetry)",
+                        "rule_activation_status = COALESCE(%s, rule_activation_status)",
+                        "rule_activation_reason = COALESCE(%s, rule_activation_reason)",
+                        "evaluator_decision = COALESCE(%s, evaluator_decision)",
+                        "evaluator_confidence = COALESCE(%s, evaluator_confidence)",
+                    ]
+                )
+                params.extend(
+                    [
+                        (
+                            Jsonb(agent_stage_telemetry)
+                            if agent_stage_telemetry is not None
+                            else None
+                        ),
+                        rule_activation_status,
+                        rule_activation_reason,
+                        evaluator_decision,
+                        evaluator_confidence,
+                    ]
+                )
+            assignments.append("finished_at = NOW()")
+            params.append(crawl_run_id)
             cur.execute(
-                """
+                f"""
                 UPDATE crawl_runs
-                SET status = %s,
-                    observed_hash = %s,
-                    processed_hash = %s,
-                    schema_hash = %s,
-                    extracted_notice_count = %s,
-                    error_code = %s,
-                    error_message = %s,
-                    llm_used = COALESCE(%s, llm_used),
-                    llm_input_tokens = COALESCE(%s, llm_input_tokens),
-                    llm_output_tokens = COALESCE(%s, llm_output_tokens),
-                    llm_cost = COALESCE(%s, llm_cost),
-                    finished_at = NOW()
+                SET {", ".join(assignments)}
                 WHERE crawl_run_id = %s;
                 """,
-                (
-                    status,
-                    observed_hash,
-                    processed_hash,
-                    schema_hash,
-                    extracted_notice_count,
-                    error_code,
-                    error_message,
-                    llm_used,
-                    llm_input_tokens,
-                    llm_output_tokens,
-                    llm_cost,
-                    crawl_run_id,
-                ),
+                tuple(params),
             )
             conn.commit()
     except Exception as exc:
@@ -607,7 +812,10 @@ def get_crawl_runs_for_review(
                        cr.candidate_count, cr.candidate_evidence,
                        cr.extracted_notice_count, cr.llm_used,
                        cr.llm_input_tokens, cr.llm_output_tokens,
-                       cr.llm_cost, cr.error_code, cr.error_message,
+                       cr.llm_cost, cr.agent_stage_telemetry,
+                       cr.rule_activation_status, cr.rule_activation_reason,
+                       cr.evaluator_decision, cr.evaluator_confidence,
+                       cr.error_code, cr.error_message,
                        cr.started_at, cr.finished_at,
                        cr.review_label, cr.review_notes,
                        cr.reviewed_by, cr.reviewed_at
@@ -623,6 +831,92 @@ def get_crawl_runs_for_review(
     except Exception as exc:
         print(f"❌ 크롤링 검토 큐 조회 에러: {exc}")
         return []
+    finally:
+        conn.close()
+
+
+def get_extraction_agent_rollout_summary(
+    *,
+    hours: int = 24,
+    recent_limit: int = 20,
+) -> Dict[str, Any]:
+    """Return bounded rollout metrics without exposing source response bodies."""
+    hours = min(max(int(hours), 1), 24 * 30)
+    recent_limit = min(max(int(recent_limit), 1), 100)
+    conn = get_db_connection()
+    if not conn:
+        return {"hours": hours, "summary": {}, "recent_runs": []}
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) AS tracked_runs,
+                    COUNT(*) FILTER (
+                        WHERE rule_activation_status = 'approved'
+                    ) AS approved_runs,
+                    COUNT(*) FILTER (
+                        WHERE rule_activation_status = 'reused'
+                    ) AS reused_runs,
+                    COUNT(*) FILTER (
+                        WHERE rule_activation_status = 'rejected'
+                    ) AS rejected_runs,
+                    COUNT(*) FILTER (
+                        WHERE rule_activation_status = 'failed'
+                    ) AS failed_runs,
+                    COUNT(*) FILTER (
+                        WHERE evaluator_decision = 'pass'
+                    ) AS evaluator_passes,
+                    COUNT(*) FILTER (
+                        WHERE evaluator_decision = 'fail'
+                    ) AS evaluator_failures,
+                    COALESCE(SUM(llm_input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(llm_output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(llm_cost), 0) AS cost_krw,
+                    COUNT(DISTINCT site_id) AS affected_sites
+                FROM crawl_runs
+                WHERE started_at >= NOW() - (%s * INTERVAL '1 hour')
+                  AND (
+                    rule_activation_status IS NOT NULL
+                    OR agent_stage_telemetry <> '[]'::jsonb
+                  );
+                """,
+                (hours,),
+            )
+            summary = dict(cur.fetchone() or {})
+            if "cost_krw" in summary:
+                summary["cost_krw"] = float(summary["cost_krw"] or 0)
+
+            cur.execute(
+                """
+                SELECT crawl_run_id, site_id, status,
+                       rule_activation_status, evaluator_decision,
+                       evaluator_confidence, agent_stage_telemetry,
+                       llm_input_tokens, llm_output_tokens, llm_cost,
+                       error_code, error_message, started_at, finished_at
+                FROM crawl_runs
+                WHERE started_at >= NOW() - (%s * INTERVAL '1 hour')
+                  AND (
+                    rule_activation_status IS NOT NULL
+                    OR agent_stage_telemetry <> '[]'::jsonb
+                  )
+                ORDER BY started_at DESC
+                LIMIT %s;
+                """,
+                (hours, recent_limit),
+            )
+            recent_runs = [dict(row) for row in cur.fetchall()]
+            for row in recent_runs:
+                if row.get("llm_cost") is not None:
+                    row["llm_cost"] = float(row["llm_cost"])
+            return {
+                "hours": hours,
+                "summary": summary,
+                "recent_runs": recent_runs,
+            }
+    except Exception as exc:
+        print(f"❌ 추출 에이전트 rollout 요약 조회 에러: {exc}")
+        return {"hours": hours, "summary": {}, "recent_runs": []}
     finally:
         conn.close()
 
@@ -708,20 +1002,31 @@ def get_user_specific_sites(user_id: int) -> List[tuple]:
     if not conn: return []
     try:
         with conn.cursor() as cur:
-            # 마지막 동기화 시간 이후에 새롭게 등록된(created_at) 공지가 하나라도 있는지 확인
+            # 사용자가 마지막으로 폴더를 열어본 뒤 등록된 공지가 있는지 확인합니다.
+            # last_synced_at은 최초 수집의 푸시 알림 기준선으로도 쓰이므로
+            # 화면의 읽음 상태는 last_viewed_at과 분리해야 합니다.
             query = """
                     SELECT s.site_id, s.site_url, us.alias,
-                    CASE 
-                        WHEN us.last_synced_at IS NULL THEN true
+                    CASE
+                        WHEN us.registration_completed_at IS NULL THEN false
                         WHEN EXISTS (
                             SELECT 1 FROM notices n 
                             WHERE n.site_id = s.site_id 
-                            AND n.created_at > us.last_synced_at
+                            AND n.is_active = true
+                            AND n.created_at > us.last_viewed_at
                         ) THEN true
                         ELSE false 
                     END as has_new,
-                    COALESCE(s.crawl_status, 'active') AS crawl_status,
-                    s.validation_error
+                    CASE
+                        WHEN us.registration_completed_at IS NULL
+                         AND COALESCE(s.crawl_status, 'active') = 'active'
+                        THEN 'pending'
+                        ELSE COALESCE(s.crawl_status, 'active')
+                    END AS crawl_status,
+                    s.validation_error_code, s.validation_error,
+                    (us.registration_completed_at IS NOT NULL)
+                        AS registration_completed,
+                    us.notification_enabled
                     FROM user_subscriptions us
                     JOIN sites s ON us.site_id = s.site_id
                     WHERE us.user_id = %s;
@@ -744,9 +1049,17 @@ def get_user_site_status(user_id: int, site_id: int) -> Optional[Dict[str, Any]]
             cur.execute(
                 """
                 SELECT s.site_id, s.site_url,
-                       COALESCE(s.crawl_status, 'active') AS crawl_status,
-                       s.validation_status, s.validation_error,
-                       s.last_validated_at
+                       CASE
+                           WHEN us.registration_completed_at IS NULL
+                            AND COALESCE(s.crawl_status, 'active') = 'active'
+                           THEN 'pending'
+                           ELSE COALESCE(s.crawl_status, 'active')
+                       END AS crawl_status,
+                       s.validation_status, s.validation_error_code,
+                       s.validation_error,
+                       s.last_validated_at,
+                       (us.registration_completed_at IS NOT NULL)
+                           AS registration_completed
                 FROM sites s
                 JOIN user_subscriptions us ON us.site_id = s.site_id
                 WHERE us.user_id = %s AND s.site_id = %s;
@@ -761,20 +1074,30 @@ def get_user_site_status(user_id: int, site_id: int) -> Optional[Dict[str, Any]]
         conn.close()
 
 def add_user_subscription(user_id: int, site_id: int, alias: str) -> bool:
-    """사용자의 구독 목록에 사이트를 추가합니다. 중복 시 별명(alias)만 갱신합니다."""
+    """구독을 추가하고 최초 수집 완료 전에는 새 소식 기준선을 열지 않습니다."""
     conn = get_db_connection()
     if not conn: return False
     try:
         with conn.cursor() as cur:
             query = """
-                INSERT INTO user_subscriptions (user_id, site_id, alias, last_synced_at)
-                VALUES (%s, %s, %s, '2000-01-01 00:00:00')
+                INSERT INTO user_subscriptions (
+                    user_id, site_id, alias, last_synced_at,
+                    registration_completed_at
+                )
+                SELECT %s, s.site_id, %s, CURRENT_TIMESTAMP,
+                       CASE
+                           WHEN COALESCE(s.crawl_status, 'active') = 'active'
+                           THEN CURRENT_TIMESTAMP
+                           ELSE NULL
+                       END
+                FROM sites s
+                WHERE s.site_id = %s
                 ON CONFLICT (user_id, site_id) 
                 DO UPDATE SET alias = EXCLUDED.alias;
             """
-            cur.execute(query, (user_id, site_id, alias))
+            cur.execute(query, (user_id, alias, site_id))
             conn.commit()
-            return True
+            return cur.rowcount > 0
     except Exception as e:
         conn.rollback()
         print(f"구독 추가 중 오류 발생: {e}")
@@ -803,15 +1126,45 @@ def delete_user_subscription(user_id: int, site_id: int) -> bool:
     finally:
         conn.close()
 
+
+def update_subscription_notification(
+    user_id: int,
+    site_id: int,
+    notification_enabled: bool,
+) -> bool:
+    """본인 구독의 신규 소식 알림 여부를 변경합니다."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE user_subscriptions
+                SET notification_enabled = %s
+                WHERE user_id = %s AND site_id = %s;
+                """,
+                (notification_enabled, user_id, site_id),
+            )
+            updated = cur.rowcount > 0
+            conn.commit()
+            return updated
+    except Exception as exc:
+        conn.rollback()
+        print(f"❌ 구독 알림 설정 업데이트 오류: {exc}")
+        return False
+    finally:
+        conn.close()
+
 def update_user_view_time(site_id: int, user_id: int):
-    """사용자가 구독 중인 사이트를 확인했을 때 동기화 시간(last_synced_at)을 갱신합니다."""
+    """사용자가 구독 폴더를 열었을 때 UI 읽음 기준만 갱신합니다."""
     conn = get_db_connection()
     if not conn: return
     try:
         with conn.cursor() as cur:
             query = """
                 UPDATE user_subscriptions 
-                SET last_synced_at = NOW() 
+                SET last_viewed_at = NOW()
                 WHERE site_id = %s AND user_id = %s;
             """
             cur.execute(query, (site_id, user_id))
@@ -825,6 +1178,108 @@ def update_user_view_time(site_id: int, user_id: int):
 
 # --- [3. 공지사항(Notice) 관리] ---
 
+def build_notice_fallback_hash(
+    *,
+    title: str,
+    author: str,
+    url: str,
+    published_at: Optional[datetime.datetime],
+) -> str:
+    """외부 ID와 상세 URL이 모두 없는 공지의 안정적인 최후 식별자입니다."""
+    identity = {
+        "title": " ".join((title or "").split()).casefold(),
+        "author": " ".join((author or "").split()).casefold(),
+        "url": (url or "").strip(),
+        "published_at": str(published_at or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _find_notice_by_identity(
+    cur,
+    *,
+    site_id: int,
+    external_id: Optional[str],
+    detail_url: Optional[str],
+    fallback_hash: Optional[str],
+    title: str,
+    author: str,
+    published_at: Optional[datetime.datetime],
+) -> Optional[int]:
+    """external_id가 있으면 그것만으로 식별하고, 없을 때만 detail_url로
+    대체 조회합니다 (deterministic_extractor._notice_identity와 동일한
+    우선순위). detail_url이 레코드마다 고유하지 않은 사이트(예: 기관
+    홈페이지 하나를 여러 공고가 공유)에서, external_id가 있는 신규
+    레코드가 그 detail_url을 먼저 쓴 다른 레코드에 잘못 병합되는 것을
+    막습니다.
+    """
+    if external_id:
+        cur.execute(
+            """
+            SELECT notice_id FROM notices
+            WHERE site_id = %s AND external_id = %s;
+            """,
+            (site_id, external_id),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    if detail_url:
+        cur.execute(
+            """
+            SELECT notice_id FROM notices
+            WHERE site_id = %s AND detail_url = %s;
+            """,
+            (site_id, detail_url),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    if fallback_hash and not external_id and not detail_url:
+        cur.execute(
+            """
+            SELECT notice_id FROM notices
+            WHERE site_id = %s
+              AND external_id IS NULL
+              AND detail_url IS NULL
+              AND record_hash = %s;
+            """,
+            (site_id, fallback_hash),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+        # 마이그레이션 이전에 record_hash 없이 저장된 fallback 공지를 흡수합니다.
+        cur.execute(
+            """
+            SELECT notice_id FROM notices
+            WHERE site_id = %s
+              AND external_id IS NULL
+              AND detail_url IS NULL
+              AND record_hash IS NULL
+              AND title = %s
+              AND COALESCE(author, '') = %s
+              AND published_at IS NOT DISTINCT FROM %s
+            ORDER BY notice_id
+            LIMIT 1;
+            """,
+            (site_id, title, author, published_at),
+        )
+        row = cur.fetchone()
+        if row:
+            return row[0]
+
+    return None
+
 def insert_notice(
     site_id: int,
     title: str,
@@ -833,7 +1288,7 @@ def insert_notice(
     created_at: datetime.datetime,
     scraped_at: datetime.datetime,
 ) -> Optional[int]:
-    """Compatibility wrapper using the valid (site_id, title) conflict key."""
+    """외부 식별자가 없는 이전 호출 경로를 fallback identity로 저장합니다."""
     return insert_or_update_notice(
         site_id=site_id,
         title=title,
@@ -842,6 +1297,135 @@ def insert_notice(
         created_at=created_at,
         scraped_at=scraped_at,
     )
+
+
+def _insert_or_update_notice_result_with_cursor(
+    cur,
+    *,
+    site_id: int,
+    title: str,
+    author: str,
+    url: str,
+    created_at: Optional[datetime.datetime],
+    scraped_at: datetime.datetime,
+    is_active: bool = True,
+    detail_url: Optional[str] = None,
+    external_id: Optional[str] = None,
+    published_at: Optional[datetime.datetime] = None,
+    content_type: Optional[str] = None,
+    record_hash: Optional[str] = None,
+) -> tuple[Optional[int], bool]:
+    """Upsert one notice and report whether this transaction inserted it."""
+    clean_title = " ".join(title.split()).strip() if title else ""
+    clean_author = author.strip() if author else ""
+    clean_url = url.strip() if url else ""
+    clean_detail_url = canonicalize_notice_detail_url(detail_url)
+    clean_external_id = (
+        str(external_id).strip() if external_id is not None else ""
+    ) or None
+    clean_record_hash = (str(record_hash).strip() if record_hash else "") or None
+    if not clean_external_id and not clean_detail_url:
+        clean_record_hash = build_notice_fallback_hash(
+            title=clean_title,
+            author=clean_author,
+            url=clean_url,
+            published_at=published_at,
+        )
+
+    existing_notice_id = _find_notice_by_identity(
+        cur,
+        site_id=site_id,
+        external_id=clean_external_id,
+        detail_url=clean_detail_url,
+        fallback_hash=clean_record_hash,
+        title=clean_title,
+        author=clean_author,
+        published_at=published_at,
+    )
+    if existing_notice_id:
+        cur.execute(
+            """
+            UPDATE notices
+            SET title = %s,
+                author = %s,
+                url = %s,
+                detail_url = COALESCE(%s, detail_url),
+                external_id = COALESCE(%s, external_id),
+                published_at = COALESCE(%s, published_at),
+                content_type = COALESCE(%s, content_type),
+                record_hash = COALESCE(%s, record_hash),
+                scraped_at = %s,
+                is_active = %s
+            WHERE notice_id = %s
+            RETURNING notice_id;
+            """,
+            (
+                clean_title,
+                clean_author,
+                clean_url,
+                clean_detail_url,
+                clean_external_id,
+                published_at,
+                content_type,
+                clean_record_hash,
+                scraped_at,
+                is_active,
+                existing_notice_id,
+            ),
+        )
+        row = cur.fetchone()
+        return (row[0] if row else existing_notice_id, False)
+
+    cur.execute(
+        """
+        INSERT INTO notices (
+            site_id, title, author, url, created_at, scraped_at, is_active,
+            detail_url, external_id, published_at, content_type, record_hash
+        ) VALUES (%s, %s, %s, %s, COALESCE(%s, NOW()), %s, %s,
+                  %s, %s, %s, %s, %s)
+        ON CONFLICT DO NOTHING
+        RETURNING notice_id;
+        """,
+        (
+            site_id,
+            clean_title,
+            clean_author,
+            clean_url,
+            created_at,
+            scraped_at,
+            is_active,
+            clean_detail_url,
+            clean_external_id,
+            published_at,
+            content_type,
+            clean_record_hash,
+        ),
+    )
+    row = cur.fetchone()
+    if row:
+        return row[0], True
+
+    # 동시에 같은 식별자가 들어온 경우 unique index의 승자 행을 반환합니다.
+    winner_id = _find_notice_by_identity(
+        cur,
+        site_id=site_id,
+        external_id=clean_external_id,
+        detail_url=clean_detail_url,
+        fallback_hash=clean_record_hash,
+        title=clean_title,
+        author=clean_author,
+        published_at=published_at,
+    )
+    return winner_id, False
+
+
+def _insert_or_update_notice_with_cursor(
+    cur,
+    **kwargs,
+) -> Optional[int]:
+    """Compatibility wrapper for callers that only need the persisted ID."""
+    notice_id, _ = _insert_or_update_notice_result_with_cursor(cur, **kwargs)
+    return notice_id
 
 
 def insert_or_update_notice(
@@ -860,119 +1444,32 @@ def insert_or_update_notice(
     record_hash: Optional[str] = None,
 ) -> Optional[int]:
     """
-    공지사항을 저장하거나, 이미 존재할 경우 정보를 업데이트하고 활성화 상태로 변경합니다.
-    (site_id, title) 제약 조건에 맞춰 작동하며, 제목의 공백을 정규화하여 중복을 방지합니다.
+    공지사항을 external_id, detail_url, fallback identity 순서로 식별하여
+    저장하거나 기존 행을 업데이트합니다. 제목은 표시 데이터일 뿐 식별자가 아닙니다.
     """
     conn = get_db_connection()
     if not conn:
         return
 
-    # 💡 [핵심] 제목 정규화: LLM이 만든 미세한 공백 차이를 DB 제약 조건과 일치시킵니다.
-    # 연속된 공백을 한 칸으로 줄이고 앞뒤 공백을 제거합니다.
-    clean_title = " ".join(title.split()).strip() if title else ""
-    clean_author = author.strip() if author else ""
-    clean_url = url.strip() if url else ""
-    clean_detail_url = detail_url.strip() if detail_url else None
-    clean_external_id = str(external_id).strip() if external_id is not None else None
-
     try:
         with conn.cursor() as cur:
-            existing_notice_id = None
-            if clean_external_id:
-                cur.execute(
-                    """
-                    SELECT notice_id FROM notices
-                    WHERE site_id = %s AND external_id = %s;
-                    """,
-                    (site_id, clean_external_id),
-                )
-                row = cur.fetchone()
-                existing_notice_id = row[0] if row else None
-            if not existing_notice_id and clean_detail_url:
-                cur.execute(
-                    """
-                    SELECT notice_id FROM notices
-                    WHERE site_id = %s AND detail_url = %s;
-                    """,
-                    (site_id, clean_detail_url),
-                )
-                row = cur.fetchone()
-                existing_notice_id = row[0] if row else None
-
-            if existing_notice_id:
-                cur.execute(
-                    """
-                    UPDATE notices
-                    SET title = %s,
-                        author = %s,
-                        url = %s,
-                        detail_url = COALESCE(%s, detail_url),
-                        external_id = COALESCE(%s, external_id),
-                        published_at = COALESCE(%s, published_at),
-                        content_type = COALESCE(%s, content_type),
-                        record_hash = COALESCE(%s, record_hash),
-                        scraped_at = %s,
-                        is_active = %s
-                    WHERE notice_id = %s
-                    RETURNING notice_id;
-                    """,
-                    (
-                        clean_title,
-                        clean_author,
-                        clean_url,
-                        clean_detail_url,
-                        clean_external_id,
-                        published_at,
-                        content_type,
-                        record_hash,
-                        scraped_at,
-                        is_active,
-                        existing_notice_id,
-                    ),
-                )
-                row = cur.fetchone()
-                conn.commit()
-                return row[0] if row else existing_notice_id
-
-            query = """
-                INSERT INTO notices (
-                    site_id, title, author, url, created_at, scraped_at, is_active,
-                    detail_url, external_id, published_at, content_type, record_hash
-                ) VALUES (%s, %s, %s, %s, COALESCE(%s, NOW()), %s, %s,
-                          %s, %s, %s, %s, %s)
-                ON CONFLICT (site_id, title) 
-                DO UPDATE SET 
-                    author = EXCLUDED.author,
-                    url = EXCLUDED.url,
-                    detail_url = COALESCE(EXCLUDED.detail_url, notices.detail_url),
-                    external_id = COALESCE(EXCLUDED.external_id, notices.external_id),
-                    published_at = COALESCE(EXCLUDED.published_at, notices.published_at),
-                    content_type = COALESCE(EXCLUDED.content_type, notices.content_type),
-                    record_hash = COALESCE(EXCLUDED.record_hash, notices.record_hash),
-                    scraped_at = EXCLUDED.scraped_at,
-                    is_active = EXCLUDED.is_active
-                RETURNING notice_id;
-            """
-            cur.execute(
-                query,
-                (
-                    site_id,
-                    clean_title,
-                    clean_author,
-                    clean_url,
-                    created_at,
-                    scraped_at,
-                    is_active,
-                    clean_detail_url,
-                    clean_external_id,
-                    published_at,
-                    content_type,
-                    record_hash,
-                ),
+            notice_id = _insert_or_update_notice_with_cursor(
+                cur,
+                site_id=site_id,
+                title=title,
+                author=author,
+                url=url,
+                created_at=created_at,
+                scraped_at=scraped_at,
+                is_active=is_active,
+                detail_url=detail_url,
+                external_id=external_id,
+                published_at=published_at,
+                content_type=content_type,
+                record_hash=record_hash,
             )
-            row = cur.fetchone()
             conn.commit()
-            return row[0] if row else None
+            return notice_id
     except Exception as e:
         print(f"❌ 데이터 저장/업데이트 중 에러 발생: {e}")
         conn.rollback()
@@ -999,6 +1496,167 @@ def deactivate_old_notices(site_id: int):
     except Exception as e:
         print(f"❌ 비활성화 에러: {e}")
         conn.rollback()
+    finally:
+        conn.close()
+
+
+def persist_verified_extraction(
+    *,
+    site_id: int,
+    method_type: str,
+    api_url: str,
+    headers: Optional[Dict[str, Any]],
+    payload: Optional[Dict[str, Any]],
+    source_hash: str,
+    notices: List[Dict[str, Any]],
+    processing_status: str,
+    extractor_config: Optional[Dict[str, Any]] = None,
+    schema_hash: Optional[str] = None,
+    extractor_confidence: Optional[float] = None,
+    crawl_run_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Atomically persist a verified rule/result and open app visibility.
+
+    The caller must only pass hard-gate/evaluator-approved results. Any API,
+    notice, processing-state, or activation failure rolls the whole operation
+    back so a partially registered source cannot become visible in the app.
+    """
+    if processing_status not in {"success", "valid_empty"}:
+        raise ValueError("검증 성공 또는 유효한 빈 결과만 저장할 수 있습니다.")
+    if processing_status == "success" and not notices:
+        raise ValueError("success 결과에는 하나 이상의 공지가 필요합니다.")
+    if processing_status == "valid_empty" and notices:
+        raise ValueError("valid_empty 결과에는 공지가 포함될 수 없습니다.")
+
+    conn = get_db_connection()
+    if not conn:
+        raise RuntimeError("검증 결과를 저장할 DB 연결이 없습니다.")
+    try:
+        with conn.cursor() as cur:
+            api_id = _upsert_api_for_site_with_cursor(
+                cur,
+                site_id=site_id,
+                method_type=method_type,
+                api_url=api_url,
+                headers=headers or {},
+                payload=payload or {},
+                last_hash=source_hash,
+                extractor_config=extractor_config,
+                schema_hash=schema_hash,
+                processing_status=processing_status,
+                extractor_confidence=extractor_confidence,
+            )
+            if not api_id:
+                raise RuntimeError("검증 API를 저장하지 못했습니다.")
+
+            persisted_notice_ids = set()
+            new_notice_ids = []
+            for notice in notices:
+                published_at = notice.get("published_at")
+                record_hash = notice.get("record_hash")
+                if not record_hash:
+                    identity = {
+                        "external_id": notice.get("external_id"),
+                        "detail_url": notice.get("detail_url"),
+                        "title": notice.get("title"),
+                        "author": notice.get("author"),
+                        "published_at": str(published_at or ""),
+                    }
+                    record_hash = hashlib.sha256(
+                        json.dumps(
+                            identity,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+
+                notice_id, was_inserted = _insert_or_update_notice_result_with_cursor(
+                    cur,
+                    site_id=site_id,
+                    title=notice.get("title"),
+                    author=notice.get("author"),
+                    url=notice.get("url"),
+                    created_at=None,
+                    scraped_at=notice.get("scraped_at"),
+                    is_active=True,
+                    detail_url=notice.get("detail_url"),
+                    external_id=notice.get("external_id"),
+                    published_at=published_at,
+                    content_type=notice.get("content_type") or "notice",
+                    record_hash=record_hash,
+                )
+                if not notice_id:
+                    raise RuntimeError(
+                        "공지를 DB에 저장하지 못했습니다. "
+                        f"site_id={site_id}, external_id={notice.get('external_id')}, "
+                        f"detail_url={notice.get('detail_url')}"
+                    )
+                if notice_id in persisted_notice_ids:
+                    raise RuntimeError(
+                        "서로 다른 추출 레코드가 동일한 DB 공지로 합쳐졌습니다. "
+                        f"site_id={site_id}, notice_id={notice_id}"
+                    )
+                persisted_notice_ids.add(notice_id)
+                if was_inserted:
+                    new_notice_ids.append(notice_id)
+
+            if processing_status == "success":
+                cur.execute(
+                    """
+                    UPDATE notices
+                    SET is_active = false
+                    WHERE site_id = %s
+                      AND is_active = true
+                      AND created_at < CURRENT_TIMESTAMP - INTERVAL '3 months';
+                    """,
+                    (site_id,),
+                )
+
+            cur.execute(
+                """
+                UPDATE api
+                SET last_hash = %s,
+                    last_observed_hash = %s,
+                    last_processed_hash = %s,
+                    processing_status = %s,
+                    retry_count = 0,
+                    next_retry_at = NULL,
+                    last_error = NULL,
+                    scraped_at = NOW()
+                WHERE api_id = %s;
+                """,
+                (
+                    source_hash,
+                    source_hash,
+                    source_hash,
+                    processing_status,
+                    api_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"API 처리 상태를 갱신하지 못했습니다: {api_id}")
+
+            # 반드시 최초 등록 구독을 활성화하기 전에 이벤트를 생성합니다.
+            # 그래야 첫 수집에서 가져온 과거 공지가 푸시 대상이 되지 않습니다.
+            notification_event_ids = create_notification_events_with_cursor(
+                cur,
+                site_id=site_id,
+                crawl_run_id=crawl_run_id,
+                new_notice_ids=new_notice_ids,
+            )
+            _activate_site_after_successful_sync_with_cursor(cur, site_id)
+            conn.commit()
+            return {
+                "api_id": api_id,
+                "persisted_notice_count": len(persisted_notice_ids),
+                "new_notice_ids": new_notice_ids,
+                "new_notice_count": len(new_notice_ids),
+                "notification_event_ids": notification_event_ids,
+            }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -1049,7 +1707,11 @@ def get_all_user_notices(user_id: int) -> List[dict]:
                 SELECT n.notice_id, n.title, n.author,
                        COALESCE(n.detail_url, n.url) AS url,
                        n.created_at, n.scraped_at, n.site_id,
-                       n.published_at
+                       n.published_at,
+                       (
+                           us.registration_completed_at IS NOT NULL
+                           AND n.created_at > us.last_viewed_at
+                       ) AS is_new
                 FROM notices n
                 INNER JOIN user_subscriptions us ON n.site_id = us.site_id
                 WHERE us.user_id = %s
@@ -1060,7 +1722,9 @@ def get_all_user_notices(user_id: int) -> List[dict]:
                     WHERE uhn.notice_id = n.notice_id 
                     AND uhn.user_id = %s
                 )
-                ORDER BY n.created_at DESC;
+                ORDER BY
+                    COALESCE(n.published_at, n.created_at, n.scraped_at) DESC NULLS LAST,
+                    n.notice_id DESC;
             """
             cur.execute(query, (user_id, user_id))
             result = cur.fetchall()

@@ -157,8 +157,8 @@ def expectation_met(
 async def register_and_scrape(case: SiteCase, user_id: int) -> SiteResult:
     """사이트 등록, 사용자 구독 연결, 크롤링을 한 항목에 대해 수행한다."""
     # --dry-run에서는 무거운 크롤러 의존성을 불러오지 않도록 지연 import한다.
-    from dataController.scraper.page_extractors import expand_url
-    from dataController.scraper.scrape_auto import run_full_scrape
+    from dataController.scraper.navigation.fetch_policy import expand_url
+    from dataController.scraper.pipeline.runner import run_full_scrape
     from dataController.security.url_safety import validate_public_url
     from repositories.notice_repo import (
         add_user_subscription,

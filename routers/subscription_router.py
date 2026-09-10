@@ -9,6 +9,8 @@ from repositories.notice_repo import (
     get_user_site_status,
     delete_user_subscription, 
     update_user_view_time,
+    update_subscription_notification,
+    update_site_crawl_state,
     insert_site,
     record_site_submission,
     select_site_id,
@@ -17,11 +19,15 @@ from repositories.user_repo import (
     get_user_max_sites_limit,             # 💡 한도 체크용 함수 임포트
     get_current_subscription_count  # 💡 구독 개수 체크용 함수 임포트
 )
-from schemas import SiteRequest, SiteResponse
+from schemas import SiteRequest, SiteResponse, SubscriptionNotificationRequest
 from dependencies import get_current_user_id
 
 from celery_app import scrape_target_site
 from dataController.security.url_safety import UnsafeUrlError, validate_public_url
+from services.site_error_service import (
+    get_public_site_error_code,
+    get_site_error_message,
+)
 
 # 라우터 태그 명확화
 router = APIRouter(tags=["Subscriptions"])
@@ -85,19 +91,42 @@ async def add_new_site(
             detail="DATABASE_ERROR"
         )
 
+    site = get_user_site_status(user_id, site_id) or {}
+    crawl_status = site.get("crawl_status", "pending")
+    registration_completed = bool(site.get("registration_completed"))
+
     try:
         scrape_target_site.delay(site_id, canonical_url)
     except Exception as exc:
+        # 이미 활성화된 사이트를 새로 구독한 경우에는 등록 자체가 완료된
+        # 상태이므로 백그라운드 새로고침 큐 실패를 등록 실패로 바꾸지 않습니다.
+        if registration_completed:
+            return {
+                "status": "success",
+                "message": "ACTIVE",
+                "site_id": site_id,
+                "crawl_status": crawl_status,
+                "registration_completed": True,
+            }
+        update_site_crawl_state(
+            site_id,
+            crawl_status="failed",
+            validation_error_code="CRAWL_QUEUE_UNAVAILABLE",
+            validation_error="크롤링 작업을 대기열에 등록하지 못했습니다.",
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="CRAWL_QUEUE_UNAVAILABLE",
         ) from exc
 
-    # 기존 Flutter 호환을 위해 status=success를 유지하고 message로 pending을 알립니다.
+    # 기존 Flutter 호환을 위해 status=success를 유지합니다. 신규 등록은 PENDING,
+    # 이미 활성화된 사이트 구독은 ACTIVE로 명확히 구분합니다.
     return {
         "status": "success",
-        "message": "PENDING",
-        "site_id": site_id
+        "message": "ACTIVE" if registration_completed else "PENDING",
+        "site_id": site_id,
+        "crawl_status": crawl_status,
+        "registration_completed": registration_completed,
     }
 
 
@@ -115,7 +144,11 @@ async def read_favorite_sites(user_id: int = Depends(get_current_user_id)):
                 "alias": r[2],
                 "has_new": r[3],
                 "crawl_status": r[4],
-                "validation_error": r[5],
+                "error_code": get_public_site_error_code(r[5]),
+                "error_message": get_site_error_message(r[5]),
+                "validation_error": r[6],
+                "registration_completed": r[7],
+                "notification_enabled": r[8],
             } for r in raw_data
         ]
     }
@@ -132,6 +165,10 @@ async def read_site_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="SITE_NOT_FOUND",
         )
+    site = dict(site)
+    stored_error_code = site.pop("validation_error_code", None)
+    site["error_code"] = get_public_site_error_code(stored_error_code)
+    site["error_message"] = get_site_error_message(stored_error_code)
     return {"status": "success", "site": site}
 
 
@@ -149,11 +186,37 @@ async def remove_subscription(
                 detail="해당 구독 정보를 찾을 수 없거나 이미 삭제되었습니다."
             )
         return {"status": "success", "message": "구독이 해지되었습니다."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"구독 해지 중 오류가 발생했습니다: {str(e)}"
         )
+
+
+@router.patch("/subscriptions/{site_id}/notification")
+async def change_subscription_notification(
+    site_id: int,
+    request: SubscriptionNotificationRequest,
+    user_id: int = Depends(get_current_user_id),
+):
+    """특정 구독의 수집 결과 알림을 켜거나 끕니다."""
+    updated = update_subscription_notification(
+        user_id,
+        site_id,
+        request.notification_enabled,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="SUBSCRIPTION_NOT_FOUND",
+        )
+    return {
+        "status": "success",
+        "site_id": site_id,
+        "notification_enabled": request.notification_enabled,
+    }
 
 
 @router.patch("/sites/{site_id}/view")
