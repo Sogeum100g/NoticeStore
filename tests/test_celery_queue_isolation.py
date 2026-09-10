@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import yaml
 
@@ -7,6 +8,7 @@ from celery_app import (
     CRAWL_QUEUE,
     NOTIFICATION_QUEUE,
     celery_app,
+    scrape_target_site,
 )
 
 
@@ -15,8 +17,8 @@ class CeleryQueueRoutingTests(unittest.TestCase):
         expected_routes = {
             "celery_app.dispatch_all_sites": CRAWL_QUEUE,
             "celery_app.scrape_target_site": CRAWL_QUEUE,
-            "celery_app.check_notifications": NOTIFICATION_QUEUE,
-            "celery_app.send_fcm_task": NOTIFICATION_QUEUE,
+            "celery_app.dispatch_pending_notification_events": NOTIFICATION_QUEUE,
+            "celery_app.process_notification_event": NOTIFICATION_QUEUE,
         }
 
         for task_name, expected_queue in expected_routes.items():
@@ -40,9 +42,32 @@ class CeleryQueueRoutingTests(unittest.TestCase):
             CRAWL_QUEUE,
         )
         self.assertEqual(
-            schedule["check-and-send-notifications-every-minute"]["options"]["queue"],
+            schedule["recover-pending-notification-events-every-minute"]["options"]["queue"],
             NOTIFICATION_QUEUE,
         )
+        self.assertNotIn("check-and-send-notifications-every-minute", schedule)
+
+    def test_scrape_task_preserves_registration_site_id(self):
+        with patch(
+            "celery_app.run_full_scrape",
+            new=AsyncMock(
+                return_value={
+                    "status": "error",
+                    "site_id": 42,
+                    "notices": [],
+                }
+            ),
+        ) as run_scrape:
+            result = scrape_target_site.run(
+                42,
+                "https://short.example/redirect",
+            )
+
+        run_scrape.assert_awaited_once_with(
+            "https://short.example/redirect",
+            site_id=42,
+        )
+        self.assertEqual(result["site_id"], 42)
 
 
 class ComposeWorkerIsolationTests(unittest.TestCase):

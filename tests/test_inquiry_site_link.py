@@ -46,6 +46,9 @@ class InquirySiteLinkTests(unittest.IsolatedAsyncioTestCase):
             "사이트와 무관한 문의입니다.",
             site_id=None,
             crawl_run_id=None,
+            site_alias=None,
+            site_url=None,
+            site_error_code=None,
         )
         self.assertEqual(result["status"], "success")
         self.assertIsNone(result["site_id"])
@@ -60,10 +63,12 @@ class InquirySiteLinkTests(unittest.IsolatedAsyncioTestCase):
         background_tasks = BackgroundTasks()
         context = {
             "site_id": 42,
+            "site_alias": "학교 공지",
+            "site_url": "https://public.example/notices",
             "crawl_status": "failed",
             "crawl_run_id": 81,
             "crawl_run_status": "failed",
-            "error_code": "PROCESSING_FAILED",
+            "error_code": "NOTICE_EXTRACTION_FAILED",
         }
 
         with (
@@ -97,10 +102,26 @@ class InquirySiteLinkTests(unittest.IsolatedAsyncioTestCase):
             "이 사이트의 공지가 보이지 않습니다.",
             site_id=42,
             crawl_run_id=81,
+            site_alias="학교 공지",
+            site_url="https://public.example/notices",
+            site_error_code="SITE_VALIDATION_FAILED",
         )
         self.assertEqual(result["crawl_run_id"], 81)
+        self.assertEqual(
+            result["site_context"],
+            {
+                "site_alias": "학교 공지",
+                "site_url": "https://public.example/notices",
+                "crawl_status": "failed",
+                "error_code": "SITE_VALIDATION_FAILED",
+                "error_message": "사이트의 정보 목록을 확인하지 못했습니다.",
+            },
+        )
         self.assertEqual(len(background_tasks.tasks), 1)
-        self.assertEqual(background_tasks.tasks[0].args[-1], context)
+        self.assertEqual(
+            background_tasks.tasks[0].args[-1]["error_message"],
+            "사이트의 정보 목록을 확인하지 못했습니다.",
+        )
 
     async def test_other_users_site_cannot_be_linked(self):
         request = InquiryRequest(
