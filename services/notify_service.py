@@ -6,6 +6,14 @@ import os
 
 # 모듈 최상단에 있던 하드코딩된 초기화 코드는 삭제했습니다.
 
+
+class InvalidFCMTokenError(Exception):
+    """The device token is permanently invalid and must not be retried."""
+
+
+class FCMDeliveryError(Exception):
+    """A transient or unknown FCM failure that may be retried."""
+
 def initialize_firebase():
     """
     Firebase Admin SDK를 초기화합니다.
@@ -29,7 +37,7 @@ def send_fcm_notification(fcm_token: str, title: str, body: str, data: Optional[
 
     if not fcm_token:
         print("⚠️ 전송 실패: FCM 토큰이 누락되었습니다.")
-        return False
+        raise InvalidFCMTokenError("FCM token is empty")
 
     safe_data = {str(k): str(v) for k, v in data.items()} if data else {}
 
@@ -42,7 +50,7 @@ def send_fcm_notification(fcm_token: str, title: str, body: str, data: Optional[
             android=messaging.AndroidConfig(
                 priority='high',
                 notification=messaging.AndroidNotification(
-                    channel_id="high_importance_channel", 
+                    channel_id="notice_store_updates",
                     sound="default"
                 )
             ),
@@ -59,12 +67,10 @@ def send_fcm_notification(fcm_token: str, title: str, body: str, data: Optional[
         print(f"✅ FCM 푸시 발송 성공 (Message ID: {response})")
         return True
 
-    except messaging.UnregisteredError:
+    except messaging.UnregisteredError as exc:
         print(f"🗑️ 만료된 토큰 발견. 앱을 삭제한 유저일 가능성이 높습니다: {fcm_token}")
-        # DB에서 해당 토큰을 무효화하거나 삭제하는 로직을 이곳에 연결해야 합니다.
-        # 예: user_repo.delete_fcm_token(fcm_token)
-        return False
+        raise InvalidFCMTokenError("FCM token is unregistered") from exc
         
     except Exception as e:
         print(f"❌ FCM 푸시 발송 실패: {e}")
-        return False
+        raise FCMDeliveryError(str(e)) from e

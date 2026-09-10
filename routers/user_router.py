@@ -53,8 +53,7 @@ async def get_user_profile(user_id: int = Depends(get_current_user_id)):
                 "provider": user_info["provider"],
                 "max_sites_limit": user_info["max_sites_limit"],
                 "social_id": user_info.get("social_id"),
-                "is_notification_enabled": user_info.get("is_notification_enabled", False),
-                "notification_time": user_info.get("notification_time", "18:00")
+                "is_notification_enabled": user_info.get("is_notification_enabled", False)
             }
         }
     except KeyError as e:
@@ -69,12 +68,11 @@ async def update_notification(
         request: NotificationSettingsRequest,
         user_id: int = Depends(get_current_user_id)
 ):
-    """사용자의 푸시 알림 수신 여부 및 시간을 업데이트합니다."""
+    """사용자의 전역 푸시 알림 마스터 스위치를 업데이트합니다."""
     try:
         success = update_user_notification_settings(
             user_id,
             request.is_notification_enabled,
-            request.notification_time
         )
         if not success:
             raise HTTPException(status_code=500, detail="알림 설정 업데이트에 실패했습니다.")
@@ -83,8 +81,7 @@ async def update_notification(
             "status": "success",
             "message": "알림 설정이 성공적으로 변경되었습니다.",
             "data": {
-                "is_notification_enabled": request.is_notification_enabled,
-                "notification_time": request.notification_time
+                "is_notification_enabled": request.is_notification_enabled
             }
         }
     except Exception as e:

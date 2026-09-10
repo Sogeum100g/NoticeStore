@@ -1,8 +1,6 @@
 import os
 import asyncio
-from datetime import datetime
 import random
-from zoneinfo import ZoneInfo
 from celery import Celery
 from celery.schedules import crontab
 from celery.utils.log import get_task_logger  # ✅ 필수 임포트 추가
@@ -11,11 +9,24 @@ from kombu import Exchange, Queue
 
 # 기존 임포트 유지
 from repositories.notice_repo import get_global_crawl_targets
-from dataController.scraper.scrape_auto import run_full_scrape
+from dataController.scraper.pipeline.runner import run_full_scrape
 
 # DB 및 알림 서비스 임포트
-from repositories.user_repo import get_users_to_notify, get_notice_summary_for_user
-from services.notify_service import send_fcm_notification
+from repositories.notification_repo import (
+    cancel_notification_event,
+    claim_notification_event,
+    delete_invalid_token,
+    finish_notification_event,
+    get_pending_event_ids,
+    get_ready_deliveries,
+    mark_delivery_failed,
+    mark_delivery_sent,
+)
+from services.notify_service import (
+    FCMDeliveryError,
+    InvalidFCMTokenError,
+    send_fcm_notification,
+)
 
 load_dotenv()
 
@@ -56,11 +67,11 @@ celery_app.conf.update(
             "queue": CRAWL_QUEUE,
             "routing_key": CRAWL_QUEUE,
         },
-        "celery_app.check_notifications": {
+        "celery_app.dispatch_pending_notification_events": {
             "queue": NOTIFICATION_QUEUE,
             "routing_key": NOTIFICATION_QUEUE,
         },
-        "celery_app.send_fcm_task": {
+        "celery_app.process_notification_event": {
             "queue": NOTIFICATION_QUEUE,
             "routing_key": NOTIFICATION_QUEUE,
         },
@@ -75,16 +86,16 @@ celery_app.conf.beat_schedule = {
     # 1. 기존 크롤링 작업
     'scrape-subscribed-sites-3-times-a-day': {
         'task': 'celery_app.dispatch_all_sites',
-        'schedule': crontab(hour='9, 13, 17', minute='14'),
+        'schedule': crontab(hour='8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18', minute='14'),
         'options': {
             'queue': CRAWL_QUEUE,
             'routing_key': CRAWL_QUEUE,
         },
     },
-    # 2. 신규: 1분마다 알림 발송 대상자 확인 (단일 등록)
-    'check-and-send-notifications-every-minute': {
-        'task': 'celery_app.check_notifications',
-        'schedule': crontab(minute='*'), # 매 분마다 실행
+    # 미발송 outbox 복구용이며 사용자 설정 시각과는 무관합니다.
+    'recover-pending-notification-events-every-minute': {
+        'task': 'celery_app.dispatch_pending_notification_events',
+        'schedule': crontab(minute='*'),
         'options': {
             'queue': NOTIFICATION_QUEUE,
             'routing_key': NOTIFICATION_QUEUE,
@@ -92,59 +103,67 @@ celery_app.conf.beat_schedule = {
     },
 }
 
-# --- [신규 알림 태스크] ---
-@celery_app.task(name='celery_app.check_notifications')
-def check_notifications():
-    """매 분마다 실행되어 조건에 맞는 사용자에게 알림을 발송합니다."""
-    kst = ZoneInfo('Asia/Seoul')
-    now_str = datetime.now(kst).strftime("%H:%M") 
-    # logger.info(f"⏰ {now_str} (KST) - 알림 대상자 확인 중...") # 💡 print -> logger.info
+# --- [구독별 신규 수집 알림 태스크] ---
+@celery_app.task(name='celery_app.dispatch_pending_notification_events')
+def dispatch_pending_notification_events():
+    """Broker 장애 등으로 즉시 처리되지 못한 outbox 이벤트를 복구합니다."""
+    event_ids = get_pending_event_ids()
+    for event_id in event_ids:
+        process_notification_event.delay(event_id)
+    return len(event_ids)
 
-    # 주의: FastAPI에서 DB 접근 함수가 비동기(async def)로 작성되어 있다면 
-    # 아래와 같이 asyncio.run()으로 감싸서 호출해야 합니다.
-    # 동기 함수(def)라면 users = get_users_to_notify(now_str) 로 그대로 둡니다.
-    try:
-        # 예시: 만약 get_users_to_notify가 비동기 함수라면
-        # users = asyncio.run(get_users_to_notify(now_str))
-        
-        # 동기 함수라면:
-        users = get_users_to_notify(now_str)
-    except Exception as e:
-        # logger.error(f"❌ 대상자 조회 실패: {e}", exc_info=True) # 💡 스택 트레이스 포함
-        return
-    
-    if not users:
-        return
 
-    # logger.info(f"👤 [Celery 스케줄러] 조회된 발송 대상자 수: {len(users)}명. 개별 큐 발송 시작...")
+@celery_app.task(
+    name='celery_app.process_notification_event',
+    bind=True,
+    max_retries=3,
+)
+def process_notification_event(self, event_id: int):
+    """구독 한 곳의 한 번의 수집 결과를 기기별로 중복 없이 발송합니다."""
+    event = claim_notification_event(event_id)
+    if not event:
+        return {"status": "skipped", "event_id": event_id}
 
-    for user in users:
-        user_id = user['user_id']
-        fcm_token = user['fcm_token']
-        
-        # 마찬가지로 비동기 함수 여부에 따라 호출 방식을 맞춰주세요.
-        summary_msg = get_notice_summary_for_user(user_id)
-        
-        if summary_msg:
-            # 개별 알림 전송을 별도의 워커에게 비동기로 위임 (Fan-out)
-            send_fcm_task.delay(fcm_token, summary_msg)
+    if not (
+        event.get("notification_enabled")
+        and event.get("is_notification_enabled")
+    ):
+        cancel_notification_event(event_id)
+        return {"status": "cancelled", "event_id": event_id}
 
-@celery_app.task(name='celery_app.send_fcm_task', bind=True, max_retries=3)
-def send_fcm_task(self, fcm_token: str, summary_msg: str):
-    """실제 FCM 서버로 통신을 담당하는 워커 태스크"""
-    try:
-        # 동기/비동기 여부 확인 후 적용 필요
-        send_fcm_notification(
-            fcm_token=fcm_token,
-            title="센트리피전 업데이트",
-            body=summary_msg,
-            data={"screen": "subscriptions"}
-        )
-        # logger.info(f"✅ FCM 전송 성공: {fcm_token[:10]}...")
-    except Exception as exc:
-        logger.error(f"❌ FCM 전송 실패, 재시도 중... 에러: {exc}")
-        # 실패 시 10초 후 재시도
-        raise self.retry(exc=exc, countdown=10)
+    alias = event.get("alias") or "구독 사이트"
+    new_count = int(event.get("new_notice_count") or 0)
+    body = f"'{alias}'에 새 소식 {new_count}건이 도착했습니다."
+    had_failure = False
+
+    for delivery in get_ready_deliveries(event_id):
+        try:
+            send_fcm_notification(
+                fcm_token=delivery["fcm_token"],
+                title="공지저장소 새 소식",
+                body=body,
+                data={
+                    "screen": "subscriptions",
+                    "site_id": event["site_id"],
+                    "event_id": event_id,
+                    "new_notice_count": new_count,
+                },
+            )
+            mark_delivery_sent(delivery["delivery_id"])
+        except InvalidFCMTokenError:
+            delete_invalid_token(delivery["token_id"])
+        except FCMDeliveryError as exc:
+            had_failure = True
+            delay = 60 * (2 ** int(delivery.get("attempt_count") or 0))
+            mark_delivery_failed(delivery["delivery_id"], str(exc), delay)
+
+    retryable = finish_notification_event(event_id)
+    if retryable and had_failure:
+        raise self.retry(countdown=60)
+    return {
+        "status": "retrying" if retryable else "complete",
+        "event_id": event_id,
+    }
     
 # --- [크롤링 작업 분배 및 실행 태스크 리팩토링] ---
 
@@ -183,10 +202,22 @@ def scrape_target_site(self, site_id: int, url: str):
     try:
         
         # 비동기(async) 함수를 동기(Celery) 환경에서 실행하기 위해 이벤트 루프 할당
-        result = asyncio.run(run_full_scrape(url))
+        # 접수 시 확정한 site_id를 끝까지 전달해야 단축 URL/리다이렉트가
+        # 전개되어도 앱이 폴링 중인 동일 사이트에 성공/실패가 기록됩니다.
+        result = asyncio.run(run_full_scrape(url, site_id=site_id))
         
         # 결과 로깅 (result가 dict 형태라고 가정)
-        status = result.get('status', 'success') if isinstance(result, dict) else 'success'
+        if isinstance(result, dict):
+            for event_id in result.pop('_notification_event_ids', []):
+                try:
+                    process_notification_event.delay(event_id)
+                except Exception as enqueue_error:
+                    # 이벤트는 DB에 남아 있으므로 beat 복구 작업이 다시 전달합니다.
+                    logger.error(
+                        "알림 이벤트 큐 적재 실패 (event_id=%s): %s",
+                        event_id,
+                        enqueue_error,
+                    )
         
         return result
 

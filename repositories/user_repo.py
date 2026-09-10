@@ -114,7 +114,7 @@ def get_user_info_by_id(user_id: int) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
             query = """
                 SELECT user_id, email, nickname, provider, social_id, 
-                       is_notification_enabled, notification_time, role,
+                       is_notification_enabled, role,
                        max_sites_limit, max_keywords_limit
                 FROM users 
                 WHERE user_id = %s
@@ -134,31 +134,25 @@ def get_user_info_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     finally:
         conn.close()
 
-def update_user_notification_settings(user_id: int, is_enabled: bool = None, time_str: str = None) -> bool:
-    """
-    사용자의 전역 알림 설정(시간, 활성화 여부)을 업데이트합니다.
-    기기별 FCM 토큰은 upsert_device_fcm_token 함수가 별도로 관리합니다.
-    """
+def update_user_notification_settings(user_id: int, is_enabled: bool = None) -> bool:
+    """사용자의 전역 푸시 알림 마스터 스위치를 업데이트합니다."""
     conn = get_db_connection()
     if not conn: return False
 
     try:
         with conn.cursor() as cur:
-            # 💡 fcm_token 컬럼 수정을 쿼리에서 제거했습니다.
             query = """
                 UPDATE users 
-                SET 
-                    is_notification_enabled = COALESCE(%s, is_notification_enabled), 
-                    notification_time = COALESCE(%s, notification_time)
+                SET is_notification_enabled = COALESCE(%s, is_notification_enabled)
                 WHERE user_id = %s
             """
-            cur.execute(query, (is_enabled, time_str, user_id))
+            cur.execute(query, (is_enabled, user_id))
             conn.commit()
             
             # 업데이트가 발생했다면 rowcount는 1 이상입니다.
             success = cur.rowcount > 0
             if success:
-                print(f"✅ DB 알림 설정 업데이트 완료 (User: {user_id}, Enabled: {is_enabled}, Time: {time_str})")
+                print(f"✅ DB 전역 알림 설정 업데이트 완료 (User: {user_id}, Enabled: {is_enabled})")
             return success
             
     except Exception as e:
@@ -250,62 +244,6 @@ def delete_device_fcm_token(user_id: int, device_id: str) -> bool:
     finally:
         conn.close()
 
-
-def get_users_to_notify(now_str: str) -> List[Dict[str, Any]]:
-    """설정된 알림 시간이 일치하고 수신이 켜져 있는 유저들의 모든 토큰 목록을 반환합니다."""
-    conn = get_db_connection()
-    if not conn: return []
-
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            # 💡 [핵심] JOIN을 통해 유저 설정과 기기 토큰을 결합합니다.
-            query = """
-                SELECT u.user_id, t.fcm_token 
-                FROM users u
-                INNER JOIN user_fcm_tokens t ON u.user_id = t.user_id
-                WHERE u.is_notification_enabled = true 
-                  AND u.notification_time = %s;
-            """
-            cur.execute(query, (now_str,))
-            return cur.fetchall()
-    except Exception as e:
-        print(f"❌ 알림 대상자 조회 중 에러 발생: {e}")
-        return []
-    finally:
-        conn.close()
-
-def get_notice_summary_for_user(user_id: int) -> Optional[str]:
-    """사용자별로 새로 업데이트된 공지사항의 요약 문구를 생성합니다."""
-    conn = get_db_connection()
-    if not conn: return None
-
-    try:
-        with conn.cursor(row_factory=dict_row) as cur:
-            query = """
-                SELECT DISTINCT us.alias
-                FROM user_subscriptions us
-                JOIN notices n ON us.site_id = n.site_id
-                WHERE us.user_id = %s
-                  AND n.created_at > COALESCE(us.last_synced_at, '1970-01-01'::timestamp)
-            """
-            cur.execute(query, (user_id,))
-            results = cur.fetchall()
-
-            if not results: return None
-
-            aliases = [row['alias'] for row in results if row['alias']]
-            if not aliases: return None
-
-            if len(aliases) == 1:
-                return f"'{aliases[0]}'에 새로운 공지가 추가되었습니다."
-            else:
-                return f"'{aliases[0]}' 외 {len(aliases) - 1}곳에 새 소식이 도착했습니다."
-
-    except Exception as e:
-        print(f"❌ 알림 요약 문구 생성 중 에러 발생 (User {user_id}): {e}")
-        return None
-    finally:
-        conn.close()
 
 def get_user_max_sites_limit(user_id: int) -> int:
     """사용자별로 허용된 최대 사이트 개수(상한선)를 가져옵니다."""
