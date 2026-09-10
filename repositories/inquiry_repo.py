@@ -15,6 +15,9 @@ def insert_inquiry(
     *,
     site_id: Optional[int] = None,
     crawl_run_id: Optional[int] = None,
+    site_alias: Optional[str] = None,
+    site_url: Optional[str] = None,
+    site_error_code: Optional[str] = None,
 ) -> bool:
     """사용자의 1:1 문의 내용을 DB에 저장합니다."""
     conn = get_db_connection()
@@ -24,9 +27,10 @@ def insert_inquiry(
         with conn.cursor() as cur:
             query = """
                 INSERT INTO inquiries (
-                    user_id, category, title, content, site_id, crawl_run_id
+                    user_id, category, title, content, site_id, crawl_run_id,
+                    site_alias, site_url, site_error_code
                 )
-                VALUES (%s, %s, %s, %s, %s, %s);
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
             """
             cur.execute(
                 query,
@@ -37,6 +41,9 @@ def insert_inquiry(
                     content,
                     site_id,
                     crawl_run_id,
+                    site_alias,
+                    site_url,
+                    site_error_code,
                 ),
             )
             conn.commit()  # 데이터 변경이 일어나는 INSERT 문이므로 반드시 commit 호출
@@ -78,12 +85,23 @@ def get_user_inquiry_site_context(
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
-                SELECT s.site_id, s.site_url,
+                SELECT s.site_id, s.site_url, us.alias AS site_alias,
                        COALESCE(s.crawl_status, 'active') AS crawl_status,
-                       s.validation_status, s.validation_error,
+                       s.validation_status,
+                       s.validation_error_code AS site_error_code,
+                       s.validation_error,
                        latest.crawl_run_id,
                        latest.status AS crawl_run_status,
-                       latest.error_code
+                       latest.error_code AS crawl_run_error_code,
+                       CASE
+                           WHEN COALESCE(s.crawl_status, 'active')
+                                IN ('failed', 'blocked')
+                           THEN COALESCE(
+                               s.validation_error_code,
+                               latest.error_code
+                           )
+                           ELSE s.validation_error_code
+                       END AS error_code
                 FROM sites s
                 JOIN user_subscriptions us ON us.site_id = s.site_id
                 LEFT JOIN LATERAL (
@@ -144,7 +162,8 @@ def get_user_inquiries(user_id: int) -> List[Dict[str, Any]]:
                 SELECT 
                     inquiry_id, category, title, content, 
                     status, created_at, reply_content, replied_at,
-                    site_id, crawl_run_id
+                    site_id, crawl_run_id, site_alias, site_url,
+                    site_error_code
                 FROM inquiries 
                 WHERE user_id = %s 
                 ORDER BY created_at DESC;

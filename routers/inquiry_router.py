@@ -17,6 +17,10 @@ from dependencies import get_current_user_id, require_admin
 
 # 서비스 및 DB 함수 임포트
 from services.notify_service import send_fcm_notification
+from services.site_error_service import (
+    get_public_site_error_code,
+    get_site_error_message,
+)
 
 
 router = APIRouter(tags=["Inquiries"])
@@ -48,11 +52,14 @@ async def send_discord_notification(
             {
                 "name": "연결된 크롤링",
                 "value": (
+                    f"사이트={site_context.get('site_alias') or '-'}\n"
+                    f"URL={site_context.get('site_url') or '-'}\n"
                     f"site_id={site_context.get('site_id')} | "
-                    f"site_status={site_context.get('crawl_status')} | "
+                    f"site_status={site_context.get('crawl_status')}\n"
                     f"crawl_run_id={site_context.get('crawl_run_id') or '-'} | "
-                    f"run_status={site_context.get('crawl_run_status') or '-'} | "
-                    f"error_code={site_context.get('error_code') or '-'}"
+                    f"run_status={site_context.get('crawl_run_status') or '-'}\n"
+                    f"error_code={site_context.get('error_code') or '-'}\n"
+                    f"오류 유형={site_context.get('error_message') or '-'}"
                 ),
                 "inline": False,
             }
@@ -63,7 +70,7 @@ async def send_discord_notification(
             "title": "📌 새로운 1:1 문의가 접수되었습니다!",
             "color": 0x3498db,
             "fields": fields,
-            "footer": {"text": "센트리피전 관리 시스템"},
+            "footer": {"text": "공지저장소 관리 시스템"},
             "timestamp": datetime.now(timezone.utc).isoformat()
         }]
     }
@@ -104,6 +111,14 @@ async def submit_inquiry(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="SUBSCRIBED_SITE_NOT_FOUND",
             )
+        site_context = dict(site_context)
+        stored_error_code = site_context.get("error_code")
+        site_context["error_code"] = get_public_site_error_code(
+            stored_error_code
+        )
+        site_context["error_message"] = get_site_error_message(
+            stored_error_code
+        )
 
     success = insert_inquiry(
         user_id,
@@ -113,6 +128,11 @@ async def submit_inquiry(
         site_id=request.site_id,
         crawl_run_id=(
             site_context.get("crawl_run_id") if site_context else None
+        ),
+        site_alias=(site_context.get("site_alias") if site_context else None),
+        site_url=(site_context.get("site_url") if site_context else None),
+        site_error_code=(
+            site_context.get("error_code") if site_context else None
         ),
     )
 
@@ -131,6 +151,17 @@ async def submit_inquiry(
             "site_id": request.site_id,
             "crawl_run_id": (
                 site_context.get("crawl_run_id")
+                if site_context
+                else None
+            ),
+            "site_context": (
+                {
+                    "site_alias": site_context.get("site_alias"),
+                    "site_url": site_context.get("site_url"),
+                    "crawl_status": site_context.get("crawl_status"),
+                    "error_code": site_context.get("error_code"),
+                    "error_message": site_context.get("error_message"),
+                }
                 if site_context
                 else None
             ),
