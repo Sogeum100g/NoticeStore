@@ -1,10 +1,12 @@
 import unittest
+from pathlib import Path
 
 from dataController.selector.candidate_analyzer import analyze_candidate_body
 from dataController.selector.candidate_ranker import build_candidate_pool, rank_candidates
 
 
 TARGET_URL = "https://maplestory.nexon.com/News/Notice"
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
 
 
 def make_candidate(
@@ -44,6 +46,104 @@ def make_candidate(
 
 
 class CandidateAnalyzerTests(unittest.TestCase):
+    def test_javascript_hydration_is_visible_to_candidate_gate(self):
+        analysis = analyze_candidate_body(
+            """
+            <script>
+              window.__APP_STATE__ = {"items":[
+                {"title":"첫 공지","createdAt":"2026-08-30","id":2},
+                {"title":"둘째 공지","createdAt":"2026-08-29","id":1}
+              ]};
+            </script>
+            """,
+            body_shape="html",
+            content_type="text/html",
+        )
+
+        self.assertEqual(analysis["analysis_kind"], "javascript_hydration")
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 2)
+
+    def test_hydration_json_is_visible_to_candidate_semantic_gate(self):
+        analysis = analyze_candidate_body(
+            """
+            <html><body><div id="app"></div>
+              <script type="application/json" id="app-state">
+                {"items":[
+                  {"title":"첫 공지","publishedAt":"2026-08-30","id":2},
+                  {"title":"둘째 공지","publishedAt":"2026-08-29","id":1}
+                ]}
+              </script>
+            </body></html>
+            """,
+            body_shape="html",
+            content_type="text/html",
+        )
+
+        self.assertEqual(analysis["analysis_kind"], "embedded_json")
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 2)
+
+    def test_hanwha_recruitment_fields_are_semantic_records(self):
+        body = (FIXTURE_DIR / "hanwha_recruit.json").read_text(
+            encoding="utf-8"
+        )
+
+        analysis = analyze_candidate_body(
+            body,
+            body_shape="json_object",
+            content_type="application/json",
+        )
+
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 2)
+        self.assertEqual(analysis["title_date_pair_count"], 2)
+
+    def test_machine_dates_in_title_attributes_are_record_evidence(self):
+        body = (FIXTURE_DIR / "dcinside_board.html").read_text(
+            encoding="utf-8"
+        )
+
+        analysis = analyze_candidate_body(
+            body,
+            body_shape="html",
+            content_type="text/html",
+        )
+
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 3)
+        self.assertNotIn("게시판 이용 설문", analysis["semantic_sample"])
+
+    def test_job_cards_outrank_ui_articles_and_footer_dates(self):
+        body = (FIXTURE_DIR / "jobkorea_recruit.html").read_text(
+            encoding="utf-8"
+        )
+
+        analysis = analyze_candidate_body(
+            body,
+            body_shape="html",
+            content_type="text/html",
+        )
+
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 3)
+        self.assertIn("넥토리얼", analysis["semantic_sample"])
+        self.assertNotIn("리스트 정렬 순서 선택", analysis["semantic_sample"])
+
+    def test_footer_dates_do_not_promote_undated_ui_articles(self):
+        analysis = analyze_candidate_body(
+            """
+            <article><h2>검색 조건 선택</h2><a href="javascript:void(0)">전체</a></article>
+            <article><h2>카테고리 선택</h2><a href="javascript:void(0)">분류</a></article>
+            <footer>개인정보처리방침 개정 18.05.09 / 상담 09:00 ~ 18:00</footer>
+            """,
+            body_shape="html",
+            content_type="text/html",
+        )
+
+        self.assertFalse(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 0)
+
     def test_config_updated_is_not_mistaken_for_date_key(self):
         analysis = analyze_candidate_body(
             '{"title":"Airbridge SDK config","lastUpdated":"2026-07-26"}',
@@ -95,6 +195,41 @@ class CandidateAnalyzerTests(unittest.TestCase):
         self.assertEqual(analysis["semantic_record_count"], 3)
         self.assertIn("title", analysis["data_key_hits"])
         self.assertIn("date", analysis["data_key_hits"])
+
+    def test_server_rendered_table_with_two_digit_year_dates(self):
+        body = """
+        <html><body><h1>공지사항</h1>
+          <table class="board-table"><tbody>
+            <tr>
+              <td>528</td>
+              <td class="b-td-left"><div class="b-title-box">
+                <a href="?mode=view&amp;articleNo=595367">첫 번째 특별 장학생 결과 발표</a>
+                <span class="b-writer">소프트웨어중심대학</span>
+                <span class="b-date">26.08.24</span>
+              </div></td>
+              <td>소프트웨어중심대학</td><td>26.08.24</td><td>7</td>
+            </tr>
+            <tr>
+              <td>527</td>
+              <td class="b-td-left"><div class="b-title-box">
+                <a href="?mode=view&amp;articleNo=595119">두 번째 활동비 지급 서류 제출 안내</a>
+                <span class="b-writer">소프트웨어중심대학</span>
+                <span class="b-date">26.08.23</span>
+              </div></td>
+              <td>소프트웨어중심대학</td><td>26.08.23</td><td>12</td>
+            </tr>
+          </tbody></table>
+        </body></html>
+        """
+        analysis = analyze_candidate_body(
+            body,
+            body_shape="html",
+            content_type="text/html",
+        )
+
+        self.assertTrue(analysis["has_repeated_records"])
+        self.assertEqual(analysis["semantic_record_count"], 2)
+        self.assertEqual(analysis["data_key_hits"], ["date", "list", "title"])
 
     def test_english_month_dates_have_repeated_record_evidence(self):
         body = """

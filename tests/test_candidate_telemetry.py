@@ -20,6 +20,12 @@ class CandidateEvidenceTests(unittest.TestCase):
                     ),
                     "score": 42,
                     "features": {"has_repeated_records": True},
+                    "content_type": "text/html; charset=UTF-8",
+                    "content_encoding": "gzip",
+                    "transfer_bytes": 83_885,
+                    "decoded_bytes": 1_182_005,
+                    "validation_transfer_bytes": 83_727,
+                    "validation_decoded_bytes": 1_182_005,
                     "validation_reason": (
                         "request failed: "
                         "https://user:secret@example.com/notices"
@@ -43,6 +49,17 @@ class CandidateEvidenceTests(unittest.TestCase):
         self.assertNotIn("secret", item["validation_reason"])
         self.assertTrue(item["selected"])
         self.assertEqual(len(item["url_hash"]), 64)
+        self.assertEqual(
+            item["response_size"],
+            {
+                "discovery_transfer_bytes": 83_885,
+                "discovery_decoded_bytes": 1_182_005,
+                "validation_transfer_bytes": 83_727,
+                "validation_decoded_bytes": 1_182_005,
+                "content_type": "text/html; charset=UTF-8",
+                "content_encoding": "gzip",
+            },
+        )
 
 
 class CandidateSelectionTelemetryTests(unittest.IsolatedAsyncioTestCase):
@@ -121,6 +138,65 @@ class CandidateSelectionTelemetryTests(unittest.IsolatedAsyncioTestCase):
             status="failed",
             error_code="NO_CANDIDATES",
             error_message="수집된 API 후보가 없습니다.",
+        )
+
+    async def test_access_challenge_sets_site_access_blocked(self):
+        blocked_candidate = {
+            "api_index": 1,
+            "api_url": "https://challenges.cloudflare.com/widget",
+            "method_type": "GET",
+            "source_kind": "access_challenge",
+            "status": 200,
+            "access_blocked": True,
+            "access_block_reason": "원격 사이트의 보안 인증 페이지가 반환되었습니다.",
+        }
+        with (
+            patch(
+                "dataController.selector.detect_api_auto.validate_public_url",
+                return_value=type(
+                    "ValidatedUrl",
+                    (),
+                    {"url": "https://public.example/notices"},
+                )(),
+            ),
+            patch(
+                "dataController.selector.detect_api_auto.notice_repo.select_api",
+                return_value=None,
+            ),
+            patch(
+                "dataController.selector.detect_api_auto.notice_repo.select_site_id",
+                return_value=7,
+            ),
+            patch(
+                "dataController.selector.detect_api_auto.collect_candidates",
+                new=AsyncMock(return_value=[blocked_candidate]),
+            ),
+            patch(
+                "dataController.selector.detect_api_auto.notice_repo.create_crawl_run",
+                return_value=52,
+            ),
+            patch(
+                "dataController.selector.detect_api_auto.notice_repo.finish_crawl_run",
+            ) as finish_run,
+            patch(
+                "dataController.selector.detect_api_auto.notice_repo.update_site_crawl_state",
+            ) as update_state,
+        ):
+            result = await find_api("https://public.example/notices")
+
+        self.assertIsNone(result)
+        finish_run.assert_called_once_with(
+            52,
+            status="blocked",
+            error_code="SITE_ACCESS_BLOCKED",
+            error_message=blocked_candidate["access_block_reason"],
+        )
+        update_state.assert_called_once_with(
+            7,
+            crawl_status="blocked",
+            validation_status="valid",
+            validation_error_code="SITE_ACCESS_BLOCKED",
+            validation_error=blocked_candidate["access_block_reason"],
         )
 
 

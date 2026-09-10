@@ -5,27 +5,17 @@ from unittest.mock import AsyncMock, Mock, patch
 from dataController.scraper import scrape_auto
 
 
-class NoDirectLlmNormalizationTests(unittest.TestCase):
-    def test_scrape_pipeline_has_no_extraction_ai_fallback(self):
+class NoDirectLlmNoticeGenerationTests(unittest.TestCase):
+    def test_scrape_pipeline_has_no_direct_llm_notice_generation(self):
         self.assertFalse(
             hasattr(scrape_auto, "structure_notices_with_llm"),
             "크롤링 파이프라인이 원문 전체 LLM 정규화 함수를 노출합니다.",
         )
-        self.assertFalse(
-            hasattr(scrape_auto, "generate_and_validate_rule"),
-            "크롤링 파이프라인이 AI 추출 규칙 fallback을 노출합니다.",
-        )
 
-    def test_data_processing_has_no_gemini_dependency(self):
-        project_root = Path(__file__).resolve().parents[1]
-        scraper_sources = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in (project_root / "dataController" / "scraper").rglob("*.py")
-        )
-
-        self.assertNotIn("GEMINI_API_KEY_DATA_PROCESSING", scraper_sources)
-        self.assertNotIn("google.genai", scraper_sources)
-        self.assertNotIn("from google import genai", scraper_sources)
+    def test_scrape_orchestrator_does_not_contain_direct_notice_prompt(self):
+        scrape_source = Path(scrape_auto.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("공지 목록을 JSON으로 생성", scrape_source)
+        self.assertNotIn("generated_notices", scrape_source)
 
 
 class FailedExtractionPipelineTests(unittest.IsolatedAsyncioTestCase):
@@ -89,7 +79,7 @@ class FailedExtractionPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["notices"], [])
         self.assertIn(
-            "AI fallback을 사용하지 않습니다",
+            "검증되지 않은 결과는 저장하지 않습니다",
             result["error_msg"],
         )
         self.assertEqual(
