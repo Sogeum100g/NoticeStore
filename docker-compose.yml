@@ -26,7 +26,7 @@ services:
     environment:
       - TZ=Asia/Seoul  # 💡 추가: OS 레벨의 타임존 강제 지정
     # ports:
-    # - "6379:6379" 
+    # - "6379:6379"
     # ports 설정 삭제: 도커 내부 네트워크를 통해서만 접근 가능하도록 격리
 
 
@@ -95,7 +95,7 @@ services:
     # ports:
     #   - "5432:5432"
     # ports 설정 삭제: 보안을 위해 외부 노출 완벽 차단
-    # 수정 부분: 127.0.0.1을 붙여서 서버 외부(인터넷)에서는 못 들어오게 막고, 
+    # 수정 부분: 127.0.0.1을 붙여서 서버 외부(인터넷)에서는 못 들어오게 막고,
     # SSH 터널링을 통한 로컬 접속만 허용합니다.
     ports:
       - "127.0.0.1:5432:5432"
@@ -110,13 +110,26 @@ services:
     image: nginx:latest
     container_name: noticestore-nginx
     ports:
-      - "80:80" # 외부의 80번 트래픽을 Nginx가 받습니다.
+      - "80:80"
+      - "443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf # 위에서 만든 설정 파일 덮어쓰기
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - certbot-etc:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
     depends_on:
-      - api # API 서버가 켜진 후 Nginx가 실행되도록 보장
+      - api
     environment:
-      - TZ=Asia/Seoul  # 💡 추가: OS 레벨의 타임존 강제 지정
+      - TZ=Asia/Seoul
+
+  certbot:
+    image: certbot/certbot
+    container_name: noticestore-certbot
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h & wait $${!}; done;'"
 
 volumes:
   postgres_data:
+  certbot-etc:
+  certbot-www:
