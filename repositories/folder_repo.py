@@ -155,7 +155,9 @@ def get_favorite_folders_tree(user_id: int) -> List[Dict[str, Any]]:
         ORDER BY sort_order ASC, created_at ASC;
     """
     notice_query = """
-        SELECT fn.folder_id, n.notice_id, n.title, n.url, n.site_id, n.created_at
+        SELECT fn.folder_id, n.notice_id, n.title, n.author,
+               COALESCE(n.detail_url, n.url) AS url,
+               n.site_id, n.published_at, n.created_at
         FROM favorite_notices fn
         JOIN notices n ON fn.notice_id = n.notice_id
         JOIN favorite_folders ff ON fn.folder_id = ff.folder_id
@@ -199,8 +201,10 @@ def get_favorite_folders_tree(user_id: int) -> List[Dict[str, Any]]:
             folder_map[f_id]['notices'].append({
                 "notice_id": row['notice_id'],
                 "title": row['title'],
+                "author": row['author'] or "",
                 "url": row['url'],
                 "site_id": row['site_id'],
+                "published_at": row['published_at'].isoformat() if row['published_at'] else "",
                 "created_at": row['created_at'].isoformat() if row['created_at'] else ""
             })
 
