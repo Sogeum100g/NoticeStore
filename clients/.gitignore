@@ -18,6 +18,11 @@ migrate_working_dir/
 *.iws
 .idea/
 
+# Firebase platform configuration
+/google-services.json
+/android/app/google-services.json
+/ios/Runner/GoogleService-Info.plist
+
 # The .vscode folder contains launch configuration and tasks you configure in
 # VS Code which you may wish to be included in version control, so this line
 # is commented out by default.
@@ -44,6 +49,13 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Secret Key Files
+serviceAccountKey.json
+client_secret_*.json
+google-credentials.json
 .env
-*.env*
+.env.*
+!.env.example
 notice-store-firebase-adminsdk-fbsvc-dc41f1152a.json
+android/app/keystore.jks
+android/key.properties

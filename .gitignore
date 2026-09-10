@@ -101,8 +101,13 @@ serviceAccountKey.json
 
 # Local repository migration backups
 /clients/.private/
+/clients/docs/
 /clients/.git.frontend-backup/
 /legacy/clients/
 
 # Local data exports; add sanitized fixtures under a dedicated test directory
 notices_*.csv
+
+# Firebase platform configuration
+**/google-services.json
+**/GoogleService-Info.plist
