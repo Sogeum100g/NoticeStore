@@ -25,8 +25,8 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(
-    title="센트리피전(NoticeStore) API",
-    description="센트리피전의 통합 백엔드 시스템입니다.",
+    title="공지저장소(NoticeStore) API",
+    description="공지저장소의 통합 백엔드 시스템입니다.",
     version="1.0.0",
     lifespan=lifespan
 )
