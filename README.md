@@ -23,6 +23,12 @@
 
 > 목표는 단순한 페이지 변경 감지가 아니라, **사용자가 먼저 찾으러 가지 않아도 새 공지가 정리되어 도착하는 경험**을 만드는 것입니다.
 
+## 프로그램 화면
+
+<img width="323" height="635" alt="image" src="https://github.com/user-attachments/assets/7a55de31-a9d5-4a23-ad56-3ef0bfad6d37" />
+<img width="323" height="635" alt="image" src="https://github.com/user-attachments/assets/21f97eed-046f-482c-ad22-c77a3ac1243e" />
+
+
 ## 주요 기능
 
 - **사이트 등록 및 구독** — 공개 게시판 URL과 별명을 등록하면 서버가 수집 가능 여부와 데이터 구조를 백그라운드에서 분석합니다.
