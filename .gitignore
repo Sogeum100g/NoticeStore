@@ -105,6 +105,9 @@ serviceAccountKey.json
 /clients/.git.frontend-backup/
 /legacy/clients/
 
+# document files
+/docs/
+
 # Local data exports; add sanitized fixtures under a dedicated test directory
 notices_*.csv
 

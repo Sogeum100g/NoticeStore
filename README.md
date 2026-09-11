@@ -1,14 +1,11 @@
 # 공지저장소 (NoticeStore)
 
-[프로젝트 문서](./docs/README.md)
-
 ## 선택·추출 에이전트 LLM 설정
 
 애매한 공지 API 후보 선택, 결정론적 규칙으로 처리할 수 없는 구조의 규칙
 추출, 신규 규칙 결과의 최초 승인은 OpenAI와 Gemini를 모두 지원한다. 승인된
 규칙의 정상 반복 크롤링은 LLM 호출 없이 결정론적으로 동작한다.
-[AI 추출 에이전트 요구사항](./docs/개선안/AI_추출_에이전트_요구사항.md)을
-참고한다.
+세부 요구사항은 로컬 운영 문서를 참고한다.
 
 ```env
 LLM_PROVIDER=openai # openai 또는 gemini
@@ -38,9 +35,7 @@ EXTRACTION_AGENT_ROLLOUT_MODE=new_sites # new_sites 또는 all
 [`20260825_add_extraction_agent_telemetry.sql`](./migrations/20260825_add_extraction_agent_telemetry.sql)을
 적용해야 한다. 설정 변경 후 컨테이너를 재시작한다.
 
-단계적 활성화와 중단 기준은
-[`AI 추출 에이전트 Rollout 운영`](./docs/개선안/AI_추출_에이전트_Rollout_운영.md)을
-따른다.
+단계적 활성화와 중단 기준은 로컬 운영 문서를 따른다.
 
 ```bash
 docker compose up -d --build api crawler_worker
